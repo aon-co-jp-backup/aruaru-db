@@ -9,6 +9,11 @@
 [![CI](https://github.com/aruaru-db/aruaru-db/actions/workflows/ci.yml/badge.svg)](https://github.com/aruaru-db/aruaru-db/actions)
 [![Discord](https://img.shields.io/badge/Discord-community-5865F2.svg)](https://discord.gg/aruaru-db)
 
+📖 他言語: [日本語](README-Japan.md) / [English](README-English.md) /
+[中文](README-Chinese.md) / [한국어](README-Korea.md) / [Español](README-Spain.md) /
+[Français](README-France.md) / [Deutsch](README-Germany.md) / [Italiano](README-Italy.md) /
+[Русский](README-Russia.md) / [العربية](README-Arabic.md)
+
 ---
 
 ## ✨ なぜ aruaru-DB か
@@ -109,6 +114,16 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 -- マージ
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
+
+---
+
+## 🔗 関連プロジェクト
+
+`open-web-server` を中心に `poem-cosmo-tauri`/`open-runo`・PostgreSQL・
+`open-raid-z` と組み合わせ、3Dオンラインゲームの課金アイテム・金融/証券
+データを紛失させないための TCP-IP/UDP-IP 三重通信 + VersionLess API と
+Git管理のハイブリッド版管理という目標アーキテクチャがある。aruaru-db は
+その分散 Git-on-SQL データ層として関与する(詳細は `CLAUDE.md` 参照)。
 
 ---
 
