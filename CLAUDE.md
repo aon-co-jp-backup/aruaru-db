@@ -1,0 +1,7274 @@
+# 設計思想・開発方針・開発環境ルール(全リポジトリ共通ヘッダー、2026-07-15追記)
+
+> ## 🎯 最重要・最優先で常に念頭に置くこと(2026-08-29、ユーザー指示により
+> ファイル冒頭へ移動——「REST APIの代替えをただ闇雲に作っても意味が無い」
+> という戒めと共に、以降このファイルを読む・編集する誰もが最初に目に
+> する位置に固定する)
+>
+> **aruaru-db は単独では完結しない。RPoemとSET(対)で使うことで初めて
+> 「REST API不要・WunderGraph Cosmo有料版(Enterprise)互換」という
+> 価値が成立する設計である。この特徴を絶対に忘れないこと。**
+>
+> - **aruaru-db(このリポジトリ)の役割**: Git-on-SQLバージョン管理+
+>   Raft強整合+HTAP(行/列ハイブリッド)を備えたPure Rust分散データ
+>   ベース。VersionlessAPI/GraphQL Federationという**コンセプト**は
+>   RPoem・WunderGraph Cosmoから参考にしているが、Cosmo自体(パッケージ)
+>   への直接依存は無い。
+> - **RPoem(SETで対になる相方)の役割**: Poem/Tauri/WunderGraph Cosmoを
+>   パッケージとして直接依存させず、機能・API形状の互換性だけをRust
+>   標準+tokio/hyperで自前実装する「第二のTomcat」的アプリケーション
+>   サーバー層。GraphQL Federation合成(`open-runo-federation`)・
+>   SCIM 2.0(`open-runo-scim`、**Cosmo自体はEnterprise限定でのみ
+>   提供する機能をOSSで実装**)・VersionlessAPI(`open-runo-
+>   versionless-api`)・APIキー自動ライフサイクル管理(`KeyGuardian`)
+>   を持つ。
+> - **【2026-08-29再調査で判明した重要な訂正】WunderGraph Cosmo
+>   **本体**(Router・Schema Registry・Studio・CLI)は実はApache 2.0の
+>   OSSであり、セルフホストも自由——**有料(Enterprise)部分は
+>   SSO(OpenID Connect)+SCIM・専有クラウド(Dedicated Cloud)に限定
+>   される**([Cosmo Enterprise公式](https://cosmo-docs.wundergraph.com/enterprise))。
+>   つまり「Cosmo有料版と互換」というこのSETの価値の実体は、**RPoemが
+>   独自に再実装したSCIM/SSO相当の機能**にある——ここを見失って
+>   「REST APIを無くすこと自体」を目的化すると、本来の価値(Enterprise
+>   限定機能をOSSで持つこと・APIキー管理を人間の手作業から解放すること)
+>   を見失った、**ただ闇雲な代替品作り**になってしまう。何かをREST→
+>   GraphQL/バイナリへ移行する提案・実装をする前に、必ず「これは
+>   RPoemとのSETとしての価値(SCIM/SSO相当・APIキー自動管理・
+>   VersionlessAPI互換)を強化するものか」を自問すること。
+> - **連携強化の具体的な実装状況**: APIキー自動ライフサイクル管理
+>   (`crates/aruaru-dist/src/keyring.rs`、RPoemの`KeyGuardian`と同じ
+>   設計を独立実装、Cargo依存は結合しない既存方針を踏襲)、Raft/WAL
+>   ノード間通信の完全バイナリ化(`crates/aruaru-dist/src/raft/
+>   binary_transport.rs`)、`/admin/*`のREST→GraphQL段階移行
+>   (`clusterStatus`・`backupSchedule`・`federatedSources`・
+>   `keyStatus`/`revokeKeys`が実データへ接続済み、詳細は下記HANDOFF
+>   参照)。**次に何か実装する前に、まずこの3点(SET連携・Cosmo
+>   本体はOSS・闇雲な代替を避ける)を再確認すること。**
+> - **【2026-08-29ユーザー補足・今後の見直し予定】open-cuda/open-directx
+>   は現時点ではこのSET連携方針の対象外(HTTP面を持たないため)だが、
+>   これは恒久的な結論ではなく今この瞬間だけの暫定判断である**——
+>   今後open-directxのDirectX互換実装・開発が進み、**OSレベルから
+>   アプリへ直接命令する、あるいはアプリがハードウェアアクセラレーター
+>   (open-directx/open-cpu)経由で動作した方がメリットが大きくなる場面
+>   が増えていく**という予測がある。そうなれば「aruaru-db+RPoem」の
+>   SETに、open-cuda・aruaru-llm・open-web-serverを含めた連携強化の
+>   検討が実際に必要になる可能性が高い(open-cuda/open-directx/
+>   README-English.md・CLAUDE.md/CLAUDE-English.mdに同内容を記録済み)。
+>
+> ### 🔄 セッション再開用メモ(2026-08-29時点、別アカウント/別セッション
+> からでもここだけ読めば続きから着手できるようにするための要約)
+>
+> - **🚨 方針転換(2026-08-29 続き5)= 管理面の抜本再設計に移行**:
+>   「REST を1本ずつ GraphQL mutation へ移す」だけでは
+>   **アンチパターン(稼働中プロセスの生状態をフィールド単位で
+>   ライブ書き換え)の移送にすぎない**、というユーザー指摘を受け、
+>   WunderGraph Cosmo の一次資料を再調査。**正本の設計文書を新設した:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)**。
+>   以後、管理面に触れる者はまずこの文書を読むこと。要点:
+>   (1) データプレーン(`aruaru-server`)の HTTP は `/graphql`・
+>   `/health*`・`/metrics`・`/v1/keys/self-issue`・内部`/raft/*`のみ、
+>   **`/admin/*` は全廃**、(2) 運用設定は**宣言的ドキュメント
+>   `aruaru.yaml` + ホットリロード**(実行時ミューテーション廃止)、
+>   (3) 一度きりのアクションのみ GraphQL Mutation、(4) 観測は
+>   GraphQL Query + Prometheus、(5) コントロールプレーンは RPoem 側
+>   (`open-runo-schema-registry` 等)。フェーズは文書 §8(P0=済、
+>   **次は P1=宣言的設定基盤 `aruaru-server::config`**)。
+>   ユーザー選択: 「全バケツを一気に再設計・再実装(複数セッション)」。
+> - **`parallel_config` の扱い(旧「保留」を解消)**: ユーザー判断で
+>   「GraphQL の4フィールド(enabled/max_workers/chunk_size/strategy)を
+>   正とし REST 側をそこへ寄せる」に決定。再設計では B1(宣言的設定)
+>   として `aruaru.yaml: query.parallel` へ移す(P2)。もう保留ではない。
+> - 以下は続き3/4までの経緯(再設計の P2〜P4 に吸収される):
+> - **直近の到達点**(`git log --oneline`で確認可): `backupSchedule`/
+>   `federatedSources`/`keyStatus`/`revokeKeys` をREST実データへ接続
+>   (第1〜3歩)。**第4歩(2026-08-29 続き3)= `object-table` を
+>   「REST完全撤廃」の初の雛形に**: `objectTable` query +
+>   `objectTableCommit`/`objectTablePrune` mutation を新設し、
+>   `admin.rs` から `/admin/object-table` `/commit` `/prune` の
+>   **3ルート・3ハンドラ・リクエスト構造体4つを削除**。
+>   `object_table` フィールドと `object_table_handle()` だけ残し、
+>   GraphQL(`AdminCtx.object_table`)へ注入する唯一の経路にした。
+>   `cargo test -p aruaru-graphql -p aruaru-server` 失敗0件で検証済み。
+>   時間旅行(スナップショット連鎖)= VersionlessAPI の核なので
+>   SET価値の直接強化と判断して選定(闇雲な代替ではない)。
+> - **RESTルート完全撤廃済み(2026-08-29 続き3/続き4)**: (1)
+>   `object-table`(`objectTable` query + `objectTableCommit`/
+>   `objectTablePrune` mutation。旧 `/admin/object-table*` 3ルート削除)、
+>   (2) `keys`(`keyStatus` query + `revokeKeys` mutation。旧
+>   `/admin/keys/status`・`/admin/keys/revoke` 削除。`/v1/keys/self-issue`
+>   は認証不要のトップレベルで存続——GraphQL等価無し)。いずれも
+>   grep で他クライアント(下記)の参照が無いことを確認してから削除。
+> - **ルート削除がまだできない「パリティ済み」組**: `clusterStatus`
+>   (`/admin/cluster`)・`backupSchedule`(`/admin/backup/schedule`)は
+>   GraphQL実データ化済みだが、**`admin/src-tauri/src/main.rs`(Tauri
+>   管理アプリ)・`android/.../MainActivity.kt`・`web/`(リバース
+>   プロキシ)が今もREST版を叩いている**。ルート削除の前にこれらの
+>   クライアントをGraphQLへ移す必要がある(この移行はユーザーに規模を
+>   共有してから着手)。`federation` も round-trip テスト済みだが
+>   Tauri アプリが `/admin/federation*` を使用。
+>   これらは既に「REST完全撤廃済み」で、再設計後もそのまま
+>   (`object-table`=B2/B3、`keys`=B2/B3 相当)。
+> - **P1(宣言的設定基盤)= 完了(2026-08-29 続き6)**:
+>   `crates/aruaru-server/src/config/`(`mod.rs`=`AruaruConfig` serde +
+>   `load()` + `${VAR}`展開、`watch.rs`=mtime ポーリング +
+>   `SIGHUP`〈`cfg(unix)`〉のホットリロード、`reconcile.rs`=動的
+>   セクションの差分を `AdminState` の `Arc<Mutex<..>>` へ冪等適用)。
+>   `--config <path>` フラグ追加(未指定なら従来どおり CLI フラグのみ)。
+>   新規依存は `serde_norway` のみ(`notify` は使わず自前 mtime ポーリング
+>   =Cosmo の `watch_config` と同方式)。`aruaru.example.yaml` を同梱。
+>   P1 で実際に反映されるのは `backup.schedule` と `federation.sources`
+>   (7テスト、`cargo test -p aruaru-server` 失敗0)。
+> - **P2(B1 の移送)= 主要部完了(2026-08-29 続き7)**:
+>   (1) `query.parallel` を4フィールド化。`AdminState.parallel` の旧7
+>   フィールド独自型を `admin_shared::ParallelConfigState` へ統一、
+>   `reconcile` 接続、GraphQL `parallelConfig` query を実データ化、
+>   `setParallelConfig` mutation と `ParallelConfigInput` を撤廃、REST
+>   `GET/POST /admin/parallel`・`get_parallel`/`set_parallel` を削除、
+>   Tauri `get_parallel_config` を GraphQL へ・`set_parallel_config` は
+>   「aruaru.yaml で管理」を返す形へ。(2) `follower_read.target_lag_ms`:
+>   `ClosedTimestampCoordinator`/`Tracker` の `target_lag_nanos` を
+>   `Arc<AtomicU64>` 共有に変更(`set_target_lag_nanos`)、`reconcile`
+>   接続、全 tracker へ即反映。(3) `wal`/`sharded_store` は静的扱い確定
+>   (`restart_required`)。`cargo test -p aruaru-dist -p aruaru-graphql
+>   -p aruaru-server` 失敗0(新規 reconcile 3件 + GraphQL 1件)。
+>   TiDB/TiFlash 等の調査結果を `docs/CONTROL_PLANE_REDESIGN.md` 付録 A へ。
+> - **P2 残り / P3 = 一部消化(2026-08-29 続き8)**:
+>   (a) ✅ `/admin/parallel/explain`・`/admin/parallel/jobs` を撤廃。
+>   GraphQL `explainDistributed` query(旧 REST の実ロジックを移植、
+>   `AdminMutation`→`AdminQuery` へ移設)と `parallelJobs` query に一本化。
+>   Tauri 2 コマンドを GraphQL へ。→ **`/admin/parallel*` は完全撤廃**。
+>   (b) ✅ `/v1/keys/self-issue` REST 撤廃 → GraphQL `selfIssueKey` mutation
+>   (`VcsMutation`、**認証ガード無し**)。`build_schema` が `AdminCtx.keyring`
+>   と同一 `KeyGuardian` を schema data へ注入。
+>   (c) ⏳ `disaster_backup.email`: config スキーマは `EmailBackupTargetConfig`
+>   と同じ7フィールドへ拡張済み(`aruaru.example.yaml` も)。reconcile 本体は
+>   `feature = "disaster_email_backup"` ゲート + `replicator` 注入の要否判断
+>   + feature ゲート付きテストが必要な**別スライス**として保留。
+>   `cargo test -p aruaru-graphql -p aruaru-server` 失敗0(GraphQL 新規3件:
+>   selfIssueKey / explainDistributed 実データ / parallelConfig 実データ)。
+> - **今すぐ着手できる次の一手 = P3 本体**:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §8。
+>   `ephemeral-query`/`multi-raft`(split/merge/scatter-query)/
+>   `sharded-store`(put/get/stats)/`closed-timestamp`(status/range/
+>   advance/plan)/`wal-service`(status/append/page/image-layer)を
+>   GraphQL query/mutation 化 → 対応 `/admin/*` ルート削除。
+>   `disaster_backup.email` reconcile(feature ゲート)。Tauri 設定タブの
+>   `aruaru.yaml` 編集 UI 化。**着手前に grep で Tauri/Android/web の
+>   該当 REST 参照を確認**(参照があれば同一コミットでクライアントも移行)。
+> - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
+>   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
+>   接続済み(再設計では B2/B3)。
+> - 続き3〜9 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き9)」を
+>   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`
+>   (§2 新・設計哲学12か条、§3 REST 完全撤廃の厳命、付録 A に
+>   CockroachDB×Snowflake ハイブリッド変種=TiDB/TiFlash 等の調査、
+>   付録 B に「REST 撤廃を可能にする Cosmo の技術」= Federation /
+>   Connect / Persisted Operations / Schema Registry+CDN)。
+>
+> ### 🛑 復活用メッセージ(次回セッション・別アカウントはまずこれを読む)
+>
+> **現在地**: aruaru-db の管理面(`/admin/*` REST)を**完全撤廃**する
+> 抜本再設計の途中。正本は [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)
+> (**2026-08-31 に付録 A を「2026 年最新設計」として大幅拡充**——A.1 に
+> TiDB/CockroachDB/YugabyteDB/Snowflake/Neon vs Aurora/SingleStore/ClickHouse/
+> Iceberg・Delta・Hudi/Photon・DuckDB の**実装方法**、A.3〜A.7 に取り込み判断と
+> `aruaru.yaml: htap` 案)。フェーズ P0(設計)/P1(宣言的設定基盤)/P2
+> (parallel・follower_read)/**P3(`closed-timestamp`・`wal-service`・
+> `sharded-store`・`ephemeral-query`・`multi-raft`、全て GraphQL 化+
+> 該当 REST ルート撤廃)まで完了**。実プロセス HTTP E2E も全スライスで
+> 完了済み(続き11〜13)。**要求③の実装トラック**: A.6-2 `ColumnarApplier`
+> 本体(続き15)・実プロセス配線(続き16)・**A.6-4 段階2 = base+delta の
+> Merge-on-Read + deletion vector 書き込み側配線(続き20)まで完了**。
+> **A.6-1 HLC・`aruaru.yaml: htap`・`Query.htapReplicas`(All)・
+> `disaster_backup.email` reconcile・別プロセス learner E2E は続き21〜25 で完了。
+> HLC 案A 全面移行(P-HLC-3a/b/c/d)は続き26〜27 で完了(内部フル精度 2
+> フィールド + 外向き u64 射影もシフト・パック・切り捨て一切無し、
+> `docs/HLC_TIMESTAMP_REDESIGN.md` §6)。次は Tauri 設定タブの `aruaru.yaml`
+> 編集 UI 化 / P4〜P6。**`git log --oneline -30` で
+> `再設計 P1〜P3`・`付録A`・`A.6-x`・`HLC P-HLC-3` のコミット群を確認。
+>
+> **ユーザーの不変の要求(肝に銘じること)**:
+> 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
+>    「削るだけ」「1本ずつ GraphQL mutation へ」の中途半端は禁止
+>    (「投げやり・その場しのぎ禁止」の原則。着手したスライスは
+>    難所も含めて最後まで通す。半分繋がった足場を成果と呼ばない)。
+> 2. RPoem は WunderGraph Cosmo 互換で REST 不要。APIキーは完全自動
+>    ライフサイクル(自動発行・自動承認・自動破棄・自動削除)。
+> 3. aruaru-db は「CockroachDB × Snowflake の良い所取りハイブリッドの
+>    特殊な変種の実在DB」の実装理論・技術を取り込む(付録 A の TiDB/
+>    TiFlash 等。Raft-Learner 列レプリカ・SI 読み取り検証・DeltaTree 型
+>    delta 層が未取り込み候補)。
+> 4. 必要なら英日・多言語で Google/GitHub を再調査し、RPoem↔aruaru-db
+>    連携強化のため再設計・再実装・再テストを**実用的になるまで数回
+>    繰り返す**。
+>
+> **次にやること(優先順、続き10 時点)**:
+> 1. ✅(続き10 完了)`closed-timestamp`(`Query.closedTimestamp` /
+>    `Query.planFollowerRead` / `Mutation.closedTsRegisterRange` /
+>    `Mutation.closedTsAdvance`)、`wal-service`(`Query.walService` /
+>    `Query.walPage` / `Mutation.walAppend` / `Mutation.walCreateImageLayer`)、
+>    `sharded-store`(`Query.shardedStoreGet` / `Query.shardedStoreStats` /
+>    `Mutation.shardedStorePut`)を GraphQL 化し、`admin.rs` から該当 REST
+>    ルート・ハンドラ・構造体・`now_nanos()` を削除。`AdminCtx` へ
+>    `closed_ts` / `wal_storage` / `sharded_store` を注入。cargo test 失敗0。
+>    `/receive`・`/publish` は B4 で残置(P4)。
+> 2. ✅(続き12 完了)`ephemeral-query`: `aruaru_dist::ephemeral`に型・
+>    `EphemeralRunner` trait を移設、`aruaru-server::ephemeral_pod::
+>    ProcessEphemeralRunner`が実装、`AdminCtx.ephemeral`へ注入。
+>    `Mutation.ephemeralQuery`が実プロセス起動込みで実HTTP動作確認済み、
+>    旧REST `/admin/ephemeral-query`は削除・404を確認。
+>    ✅(続き13 完了)`multi-raft`: `EngineApplier`(`Applier`実装)を
+>    `aruaru-server::cluster`から`aruaru_dist::engine_applier`へ移設し、
+>    `aruaru-graphql`が`aruaru_dist::MultiRaftCluster<aruaru_dist::
+>    EngineApplier>`を具体型のまま共有(`Arc<dyn MultiRaftHandle>`trait
+>    object化は不要と判明)。`Query.multiRaftScatterQuery`・
+>    `Mutation.multiRaftSplit`/`multiRaftMerge`が実HTTP動作確認済み、
+>    旧REST`/admin/multi-raft/{split,merge,scatter-query}`は削除・
+>    トークン付きで404を確認。
+> 3. ✅(続き11 完了)**実プロセス HTTP E2E**: 実 `aruaru-server` を起動し
+>    `closedTimestamp`/`closedTsRegisterRange`/`closedTsAdvance`・
+>    `walService`(safekeeper `1..=n` 是正の実証込み)・`shardedStorePut`/
+>    `shardedStoreGet`・`selfIssueKey` を実 `/graphql` へ実 HTTP で確認。
+>    旧 REST パス(`/admin/closed-timestamp`等)はトークン付きで `404`
+>    (真の削除、トークン無しの `401` に惑わされないこと)を確認。
+>    残置 REST(`/admin/cluster` 等)は `200` のまま(非破壊)を確認。
+> 4. **⏳ 要求③の実装トラック**: A.6-2 `ColumnarApplier` 本体は続き15、
+>    実プロセス配線は続き16、**A.6-4 段階2(base+delta の Merge-on-Read
+>    + deletion vector の書き込み側配線)は続き20 で完了**(8ユニット
+>    テスト green、2プロセス実HTTP E2E で実証)。**A.6-1 HLC は続き21 で
+>    完了**——`docs/HLC_TIMESTAMP_REDESIGN.md`(u64 オーバーフローの
+>    設計ミスを一次資料調査で再設計、案B=物理を 65µs 粒度へ切り捨てて
+>    下位 16bit に論理を収める)、`hlc.rs` 全面書き換え(13テスト)、
+>    `closed_ts` 系の「now 既定値」を HLC ordinal へ配線
+>    (`AdminState`/`AdminCtx` 共有、`closed_ts_receive` で
+>    `observe_ordinal`)、実HTTP E2E で `closedTsAdvance` が実 Unix
+>    ナノ秒スケールの単調 ordinal を返すことを確認。
+>    **続き22(2026-09-02、ビルドまで)で (a)〜(d) 前半まで完了**:
+>    (a) ✅ `config::HtapConfig`(`columnar_replicas`/`read_consistency`/
+>    `delta.compaction_threshold`、static 扱い)+ `ColumnarApplier::
+>    with_compaction_threshold` + `--columnar-learner` を `--config` 経由の
+>    `htap.delta.compaction_threshold` へ統合、`aruaru.example.yaml` に
+>    `htap:` ブロック。
+>    (b) ✅ `ColumnarApplier::prune_range_preview`/`prune_equality_preview`
+>    (MoR ビューを `disproves`/bloom へ流し `HtapPrunePreview` を返す、
+>    全行論理削除 block も skip)+ `GET /columnar/:table/prune?column&op&value`。
+>    (c) ✅ `Applier::apply_at(index, cmd)`(既定は `apply` 委譲)を追加、
+>    `ColumnarApplier` が `applied_index`/`applied_commit_seq` を記録
+>    (失敗エントリでは前進しない)。`read_at_index(table, required_index,
+>    required_commit_seq)` が未達なら `Err(StaleRead)`、達していれば
+>    `HtapReplicaView`。`GET /columnar/:table` に `appliedIndex`/
+>    `appliedCommitSeq`、`?required_index=&required_commit_seq=` 指定時は
+>    未達で 409 CONFLICT。
+>    (d) ✅ `Hlc::max_offset_nanos`(0=無効)+ `try_update`/
+>    `try_observe_ordinal`(壁時計+max_offset を超えたリモートは
+>    `Err(ClockSkew)`、permissive `update` はリモート無視でローカル進行のみ)。
+>    `config::follower_read.max_offset_ms`(動的、reconcile で HLC へ反映)、
+>    `admin.rs::closed_ts_receive` が `try_observe_ordinal` で遠すぎる
+>    リモート closed-ts を拒否。**案A(2フィールド全面移行)は
+>    `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として引き続き将来課題**。
+>    検証: `cargo test -p aruaru-dist -p aruaru-server` 失敗0
+>    (aruaru-dist 101、hlc 15 / columnar_applier 14)、`cargo build
+>    --workspace` 成功(既存 `build_cluster`/`propose_commit` 警告のみ)。
+>    **続き23(2026-09-02)で (a)〜(d) を実 HTTP E2E で確認 + `Query.htapReplicas`
+>    を GraphQL 単一サーフェスへ正式公開**: 本番 `aruaru-server` が
+>    `aruaru.yaml: htap.columnar_replicas: true` で同居(co-located)
+>    `ColumnarApplier`(本番 `QueryEngine` 共有、`set_columnar_observer`
+>    通知で `observe_table` 追従)を立て、`Query.htapReplicas(table,
+>    pruneColumn, pruneOp, pruneValue)` が TiFlash `TIFLASH_REPLICA`
+>    (PROGRESS/AVAILABLE)相当の同期状態 + 枝刈り込みプレビューを返す。
+>    E2E(release): `execSql` で CREATE+5 INSERT → 自動追従
+>    (`replicationCount=6`)、`available=true`/`progress=1.0`/`blockCount=6`/
+>    `liveRowCount=5`、`prune amount>250` で `skippedBlocks=2`/
+>    `keptLiveRows=3`、DELETE で `deletionVectorPositions=1`、未知テーブルは
+>    `available=false`。`max_offset_ms=60000` 設定で `closed_ts_receive` が
+>    far-future リモート値を HLC 汚染前に拒否(WARN 確認)。**残り**: 
+>    `--columnar-learner` 真の別プロセス learner での `?required_index=` 409
+>    実 HTTP、HLC 案A 全面移行(P-HLC-3)。
+> 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
+>    ゲート。config スキーマは 7 フィールドへ拡張済み)。
+> 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
+>    の残りコマンドを GraphQL へ。設定タブは `aruaru.yaml` 編集 UI に。
+> 7. P4: `admin::admin_routes` 撤去、`/raft/*`・side transport をバイナリ化。
+>    P5: RPoem を execution-config / persisted operations / feature flags の
+>    CDN(コントロールプレーン)役に。P6: 各言語 README・PORTING 整合。
+>
+> **毎回の作法**: スライス完了ごとに `cargo test -p <対象クレート>` 失敗0を
+> 確認 → CLAUDE.md のこのメモと HANDOFF を更新 → commit → push
+> (リミット接近前に必ず)。
+> ビルドは 1 回 30分超のことがあるので background + Monitor で回す。
+
+> **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
+> 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
+> 関連リポジトリは全て、リポジトリ名-installer.exeに統一して」への対応
+> (aruaru-llm/open-englishと同じ規則)。`installer/windows/aruaru-db.iss`
+> ——既存`install.ps1`のサービス登録ロジック(`New-Service`)をそのまま
+> 呼ぶGUIラッパー。**正直な開示**: aruaru-dbはWindowsサービスとして
+> 登録される設計のため、サービス登録自体が管理者権限を必須とする——
+> `PrivilegesRequired=admin`とし、Inno Setup標準のUAC昇格プロンプトを
+> 1回表示する形にした(aruaru-llm/open-englishのような`lowest`にはできない、
+> 「管理者権限が一切不要になる」わけではなく「利用者が自分で管理者権限の
+> PowerShellを探して起動する手間を無くす」ことが目的)。`[UninstallRun]`で
+> サービス解除も追加(`Remove-Service`はPowerShell 6+限定でこの環境の
+> Windows PowerShell 5.1には存在しないことを実際に確認したため、
+> `sc.exe delete`を使用)。**実機検証**: `cargo build --release --bin
+> aruaru-server`成功、`ISCC.exe`で実際に`aruaru-db-installer.exe`を生成
+> (警告0件)。実際のサービス登録(管理者権限でのインストール実行)は
+> この開発環境では未検証(既存`install.ps1`のロジック自体は変更して
+> いないため、これまでの動作実績をそのまま引き継ぐ設計)。
+> CI(`.github/workflows/release.yml`)もInno Setupビルドを追加しGitHub
+> Releaseへ添付するよう更新済み(実CI実行の確認は次回タグpush時)。
+
+> **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
+> ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
+> Bifurcation Machine)**と**DeepSeekの技術**(インターネットニュースだけ
+> でなく、論文〈DeepSeek-V3/R1テクニカルレポート等〉・実装ノウハウの
+> ブログまで日英両言語でGoogle/GitHub調査)を、`dream-os`/`open-directx`/
+> `open-cuda`/`aruaru-llm`/`open-web-server`/`RPoem`/`open-raid-z`/
+> `aruaru-db`の8リポジトリへ組み込む構想がある。東芝SBMは`dream-os`
+> (`sbm_ising`カーネル、64スピンPoC)に実装済み——他リポジトリへの適用は
+> 各リポジトリで「何を最適化するか」を先に特定してから着手すること
+> (このリポジトリ固有の候補は未検討、次回調査対象)。DeepSeekは前回調査で
+> 「数千枚のGPUを1枚に圧縮する技術」という主張は確認できなかった(誤解・
+> 誇張と判断済み)——今回は論文・実装ブログまで調査範囲を広げ、実在する
+> 技術(MLA・DeepSeekMoE・FP8混合精度学習等)を特定してから適用箇所を
+> 検討すること。詳細は`dream-os/CLAUDE.md`の同日HANDOFF参照。
+>
+> By user instruction, there is a plan to incorporate **Toshiba's
+> pseudo-quantum-computer technology (Simulated Bifurcation Machine)**
+> and **DeepSeek's technology** (researched via Google/GitHub in both
+> Japanese and English, going beyond news articles to actual papers
+> like the DeepSeek-V3/R1 technical reports and implementation-notes
+> blogs) into 8 repositories: `dream-os`, `open-directx`, `open-cuda`,
+> `aruaru-llm`, `open-web-server`, `RPoem`, `open-raid-z`, and
+> `aruaru-db`. Toshiba SBM is already implemented in `dream-os` (the
+> `sbm_ising` kernel, a 64-spin PoC) — applying it elsewhere requires
+> first identifying a concrete optimization problem in each repo (not
+> yet investigated for this repo). The previous DeepSeek research found
+> no evidence for a "compress thousands of GPUs into one" technology
+> (judged to be a misunderstanding/exaggeration) — this time, broaden
+> the research to papers and implementation blogs, identify real
+> techniques (MLA, DeepSeekMoE, FP8 mixed-precision training, etc.),
+> then decide where they apply. See the same-day HANDOFF entry in
+> `dream-os/CLAUDE.md` for details.
+
+
+## 1. 比較的新しい言語・フレームワークの参照資料一覧
+
+Rust自体は歴史があるが、本エコシステムが採用する **Poem** のような
+比較的新しい・情報量がまだ少なめのWebフレームワークは、Python+FastAPIの
+ような広く普及した組み合わせと比べ、AIモデルの学習データ・公開されている
+実装例/Q&A/ブログ記事の絶対量が少ない傾向がある。そのため、AI駆動開発
+(Claude等)がこれらを扱う際、実装の勘違い・API名の記憶違い・古いバージョン
+のAPIでの実装(本プロジェクトで実際に複数回発生した既知の失敗パターン)に
+よる**手戻り・いたちごっこ**が起きやすい。
+
+対策として、AIが作業を始める際は、以下から**そのタスクに必要な部分だけ**を
+先に参照してから実装に着手すること(全部読む必要はない。関連しそうな1〜2件を
+拾い読みする程度で十分)。これにより歩留まりが上がり、AI駆動開発の手戻りが
+減ることが期待される。
+
+| 技術 | 公式ドキュメント | GitHub | 補足・ブログ等 |
+|---|---|---|---|
+| Rust言語本体 | https://doc.rust-lang.org/book/ | https://github.com/rust-lang/rust | https://blog.rust-lang.org/ |
+| Poem(Webフレームワーク) | https://docs.rs/poem/latest/poem/ | https://github.com/poem-web/poem | https://crates.io/crates/poem |
+| Tokio(非同期ランタイム) | https://tokio.rs/tokio/tutorial | https://github.com/tokio-rs/tokio | https://tokio.rs/blog |
+| async-graphql | https://async-graphql.github.io/async-graphql/en/index.html | https://github.com/async-graphql/async-graphql | https://crates.io/crates/async-graphql |
+| Tauri | https://tauri.app/ | https://github.com/tauri-apps/tauri | https://tauri.app/blog/ |
+| wasm-bindgen / web-sys | https://rustwasm.github.io/wasm-bindgen/ | https://github.com/rustwasm/wasm-bindgen | https://rustwasm.github.io/docs/book/ |
+| SurrealDB | https://surrealdb.com/docs | https://github.com/surrealdb/surrealdb | https://surrealdb.com/blog |
+| sqlx | https://docs.rs/sqlx/latest/sqlx/ | https://github.com/launchbadge/sqlx | |
+| WinFsp | https://winfsp.dev/ | https://github.com/winfsp/winfsp | |
+| DirectX 12 / DirectML | https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide | https://github.com/microsoft/DirectML | https://devblogs.microsoft.com/directx/ |
+| WebAssembly(wasm32全般) | https://webassembly.org/ | https://github.com/WebAssembly | https://rustwasm.github.io/docs/book/ |
+
+> ⚠️ **重要な注意(正直な開示)**: このURL一覧は、Web検索ツールを持たない
+> セッションで学習データに基づき記載したものであり、**実在性・現在の
+> 有効性・記載内容の正確性を検証していない**。特にAI(Claude含む)が
+> このリストを鵜呑みにして実装や回答の根拠にすることは避け、
+> **開発者自身が実際にアクセスして確認する**か、Web検索が使える
+> セッションで一次情報を再確認してから利用すること。リンク切れ・
+> リダイレクト・バージョン変更(特にAPIの破壊的変更)の可能性を
+> 常に考慮する。新しい技術を追加する場合はこの表に追記していくこと。
+
+## 2. AI駆動開発ツールに関する所感(2026-07-15、ユーザー所感として記録)
+
+2026-07-15時点、ChatGPT等の汎用AIチャットは小規模なWebアプリ程度までは
+開発できるものの、システムがある程度複雑・大規模になると出戻りが大きくなり、
+一度に扱えるプログラムサイズにもすぐ限界が来る傾向がある。
+
+Claude Code / Claude Desktopは、ローカルドライブを直接指定してファイルの
+読み書きができ、GitHubリポジトリの読み出し(本プロジェクトのような
+複数リポジトリにまたがるエコシステム)にも対応できるため、本プロジェクトの
+ような規模のAI駆動開発には適していると考えられる。新しくAI駆動開発環境を
+セットアップする際の選択肢として推奨する。
+
+---
+
+# 技術スタック・開発ルール(aruaru-db)
+
+このリポジトリ、および関連プロジェクト(`open-runo`/`open-web-server`/
+`poem-cosmo-tauri`/`aruaru-web`/`open-raid-z`)で開発・保守を行う際は、以下を基本方針とする。
+作業ドライブは `F:\open-runo`(E:ドライブは2026-07-10に消失、以後Fが実体)。
+この節は [`open-raid-z`](https://github.com/aon-co-jp/open-raid-z) の
+`CLAUDE.md` を正本とし、各プロジェクトへコピーして同期する。
+
+## 方針転換(2026-07-10、open-raid-z 正本より転記・最終確定)
+
+ユーザー指示により以下へ転換・確定。**Tauri・Poem・WunderGraph Cosmo(有料版
+含む)を外部パッケージ/ライブラリとして直接依存させることはしない**。ただし
+各ツールが提供する**機能・API形状・体験には互換性を保ち**、Rust標準ライブラリ
++ tokio/hyper で自前実装して置き換える(依存だけを断ち、機能面の互換性は
+維持する)。**`poem-cosmo-tauri` と `open-runo` は2リポジトリを同時並行で
+開発する**。実装(例: Poem→tokio/hyper移行)は poem-cosmo-tauri 側で先行させ、
+動作確認できたファイルを open-runo へミラーする運用とする。
+
+> **aruaru-db 固有の注記(2026-07-11)**: 本リポジトリの `aruaru-graphql` /
+> `aruaru-wire` / `aruaru-server` クレートは現時点で **この方針転換に未移行**
+> —— `poem` / `async-graphql-poem` / `pgwire` への直接依存が残っている
+> (`Cargo.toml` の `workspace.dependencies` 参照)。2026-07-10 の方針転換は
+> 本リポジトリにもいずれ適用されるべきだが、Poem/pgwire を剥がす作業は
+> GraphQL 層・pgwire サーバ層の総入れ替えとなり影響範囲が広いため、今回の
+> 巡回では着手していない(下記「現状・重要な引き継ぎ事項」参照)。次回以降、
+> 専用のマイグレーションパスとして計画すること。なお `pgwire` への依存は
+> PostgreSQL ワイヤプロトコル互換を提供するためのものであり、Poem/Cosmo の
+> 置き換え対象(HTTPフレームワーク層)とは別軸の依存である点に注意。
+
+**poem-cosmo-tauri と open-runo の違い(2026-07-11、ユーザー確認済み、
+open-raid-z正本より転記)**: 両者は共通コア(Cosmo有料版機能のOSS Rust
+再実装)を持つが**全く違うリポジトリのプロジェクト**であり統合対象では
+ない。poem-cosmo-tauri はさらに範囲が広く、Poem/Tauriの**全機能を
+AI駆動開発で一から自作・再現する**という上乗せ目標を持つ(open-runoには
+ない)。詳細は open-raid-z の `CLAUDE.md` を参照。
+
+**open-web-server 拡張要件との関わり(2026-07-13、要約を統合・整理)**:
+`open-web-server` は、3Dオンラインゲームのアイテム課金やクレジット
+カード決済のような金融データを扱う、24時間365日ノンストップ運用の
+ミッションクリティカルな Web サーバー。4層防御通信による高セキュリティ
+と高速性の両立、およびZFS互換(`open-raid-z`)とACID互換(PostgreSQL)の
+ハイブリッド技術を核として、poem-cosmo-tauri/open-runo・PostgreSQL・
+このリポジトリ(`aruaru-db`)・`open-raid-z`と連携する多層防御
+アーキテクチャにより、二重課金・データ消失を防ぐ。通信層の四重化
+(TCP-IP・UDP-IP・QUIC・MPTCP/SCTP相当)・DB書き込みの四重化
+(PostgreSQL・aruaru-db・マルチリージョン同期レプリケーション・独立
+監査ログ、全系統実装済み)・VersionLessAPIとGit管理(このリポジトリの
+Git-on-SQL特性を利用)のハイブリッド版管理の詳細・進捗は
+`open-web-server/CLAUDE.md`(および正本の open-raid-z `CLAUDE.md`)を
+参照。このリポジトリは分散Git-on-SQLデータ層として関与する
+(ZFS互換スナップショット連携=`aruaru-dist::snapshot_pairing`、実装済み)。
+
+## フロントエンド
+
+- Tauriパッケージには直接依存しない。ただしTauriのデスクトップUI体験・
+  `invoke()`的な呼び出しインターフェースとは互換性を保つ。
+- **HTML5/CSS3・TypeScript・Bootstrap・Node.jsのスタックは廃止**。
+  Rustをメイン言語としてフロントエンドとバックエンドを統合し、
+  **WebAssembly (WASM)** に置き換える(コンパイル対象はRust →
+  `wasm32-unknown-unknown`)。https://webassembly.org/ | https://rustwasm.github.io/
+- **aruaru-db 固有の注記**: `admin/` 配下の管理GUIは現状 Tauri + TypeScript
+  のまま(`README.md` にも "Tauri Admin GUI" と記載)。WASM移行は未着手。
+
+## バックエンド・コア
+
+- **Rust**(メイン言語、標準ライブラリ中心): https://www.rust-lang.org/ja/
+- **tokio** + **hyper**(Webフレームワークなしで直接HTTPサーバを自前実装):
+  https://tokio.rs/ | https://docs.rs/hyper/latest/hyper/
+- Poemパッケージには依存しないが、Poemのルーティング/ハンドラAPI形状とは
+  互換性のあるインターフェースを維持しながらtokio/hyper直接実装へ移行する。
+- **openraft**(Raft分散合意)・**DataFusion**(OLAPクエリ)・**pgwire**
+  (PostgreSQL互換プロトコル) は引き続き本リポジトリの中核依存。
+
+### パフォーマンス・並行処理方針(2026-07-13、ユーザー指示)
+
+システム全体として、4層4重の通信・DB冗長化によるハイセキュリティを
+保ちつつ、ハイパースレッディング/マルチコア/マルチスレッドを活かした
+高速性を両立させる。**非同期(tokio、マルチスレッドランタイム)を基本**
+とし、必要な場面(CPU負荷の高い計算・厳密な順序保証が必要な処理等)での
+み同期処理を用いる。着眼点: (1) `#[tokio::main]`のランタイムflavorが
+current_threadに固定されていないか、(2) async関数内でのブロッキング
+I/O・CPU負荷処理は`tokio::task::spawn_blocking`へ退避、(3) CPU律速な
+処理(チェックサム計算・OLAPクエリ等)は`rayon`/`DataFusion`の並列実行を
+活用、(4) セキュリティクリティカルなホットパスの排他ロックがボトル
+ネックになっていないか、を確認する。
+
+- **aruaru-db 固有の注記**: `aruaru-graphql`/`aruaru-server` は現状 `poem` +
+  `async-graphql-poem` に直接依存している(上記の通り未移行)。
+
+## API設計思想(参考・概念のみ)
+
+- **VersionLess API**という考え方を参考にする(WunderGraphのブログ/podcast参照)。
+- **WunderGraph Cosmo**: パッケージとしては直接依存させない。GraphQL
+  Federation / VersionlessAPI というAPI形状・コンセプトのみ参考にし、
+  Rust標準+tokio/hyperで互換性を保ちつつ自前実装する。
+  https://github.com/wundergraph/cosmo
+
+## 契約不要の独自AI(open-cuda × aruaru-llm SET、2026-07-18追記、正本はopen-raid-z参照)
+
+外部AI事業者との有償契約・APIキー(OpenAI等)を必要としない、自前完結の
+AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成を標準
+として使うこと。詳細は`open-raid-z/CLAUDE.md`の同名節を参照。
+
+## 「分身の術」構成の対象拡大(2026-07-18追記、正本はopen-raid-z参照)
+
+`open-web-server`の「分身の術」(共有バックエンドインスタンスへの動的
+テナント登録、個別インストール不要)を、`open-cuda`・`aruaru-llm`・
+`RPoem`・`RCosmo`・`open-raid-z`・**このリポジトリ(`aruaru-db`)**にも
+適用する。マルチCPU/マルチコア/マルチスレッド非同期処理対応、
+`POST /admin/tenants`系APIでの動的テナント登録、管理は`open-easy-web`
+側から行う。現状`aruaru-llm`にのみ`src/tenants.rs`実装済み、このリポジトリ
+への展開は未着手(次回以降の実装対象)。詳細は`open-raid-z/CLAUDE.md`参照。
+
+## 関連プロジェクト
+
+- **poem-cosmo-tauri**(open-runoと同時並行開発。実装の先行地点。Pure Rust
+  + tokio/hyper直接実装): https://github.com/aon-co-jp/RPoem
+- **open-runo**: https://github.com/aon-co-jp/open-runo
+- **open-web-server**: https://github.com/aon-co-jp/open-web-server
+- **aruaru-db**(このリポジトリ): https://github.com/aon-co-jp/aruaru-db
+- **open-easy-web**(第二のKUSANAGI、ドメイン/サブドメイン簡単登録+HTTPS
+  自動監視/発行/更新の易操作ツール。高速化機能は含まない、2026-07-13に
+  aruaru-webから分離): https://github.com/aon-co-jp/open-easy-web
+- **aruaru-web**(2026-07-13廃止。役割はopen-easyweb(易操作)と
+  open-runo/poem-cosmo-tauri(高速化)へ分割継承済み): https://github.com/aon-co-jp/aruaru-web
+- **open-raid-z**(開発ルールの正本): https://github.com/aon-co-jp/open-raid-z
+- **rs-to-readme**: https://github.com/aon-co-jp/rs-to-readme
+
+## 運用ルール
+
+- **開発中はこの`CLAUDE.md`を、コード変更のコミット/pushと必ず一緒に push する**。
+- 実装で迷った場合は、学習データからの推測より公式ドキュメントを優先して参照する。
+- 作業ドライブが変わった場合は、この節と関連プロジェクトの引き継ぎ資料を更新する。
+- **無人自動開発(確認不要・自動デバッグ)のタイミングでは、20〜30分おきの
+  スケジュール実行待ちにせず、1パス内でできる限り連続して作業を進める**
+  こと。小さく検証可能な単位(1クレート/1関数ごとに `cargo test` →
+  commit)を保ちながらも、次の増分に進む前にバックグラウンド待機で
+  止まらない。
+- **各無人開発パスの最後には、必ず以下を実行すること**(ユーザー指示、
+  2026-07-11): (1) 世界10ヶ国語のREADME(`README-<言語>.md`、日本語・
+  英語・中国語簡体字・韓国語・スペイン語・フランス語・ドイツ語・
+  イタリア語・ロシア語・アラビア語)を、そのパスで行った実装内容に
+  合わせて更新する、(2) 他プロジェクトへのお引越し可能ファイル
+  (`PORTING.md`)を同様に最新の実装内容に合わせて更新する、(3) この
+  開発環境ルール(`CLAUDE.md`)のHANDOFF節・現状節を更新して保存する、
+  (4) 上記(1)〜(3)を含む全ての変更をコミットしてpushする。この4点を
+  終えてから、そのパスを終了する。
+- **ドキュメント(parity調査・ギャップ一覧・HANDOFF等)に「未調査」「未着手」
+  「意図的に先送り」「将来検討」等と記録されている項目を見つけた場合、
+  それは承認待ちの提案ではなく、次に着手すべき実装対象そのものである**
+  (ユーザー指示、2026-07-12)。「ご指示はありますか?」のように追加の
+  確認を求めて手を止めず、確認不要でそのまま実装を進めること。
+  優先度・実現可能性の判断(例: ブラウザ実行という設計上の制約で
+  技術的に不可能な項目は代替案を検討する)は自分で行ってよいが、
+  「未着手だから今回は見送る」という判断そのものをユーザーへの
+  確認なしに下してはならない——見送る場合も、まず着手を試み、
+  真に不可能/著しく非現実的と判明した場合のみ、その理由をドキュメントに
+  明記した上で次の項目に進む。
+- **技術選定・仕様確認で迷った場合、必要に応じて日本語と英語の両方で
+  Google検索し、Claude(自分自身)の知識・推論も動員し、GitHubでも
+  調査すること**(ユーザー指示、2026-07-13)。
+  学習データからの推測だけに頼らず、実在するクレート・ライブラリの
+  現状(バージョン・メンテナンス状況・プラットフォーム対応)や、
+  最新の実務知見(2026年時点のベストプラクティス等)を実際に検索して
+  裏付けを取ってから実装判断を下す。日本語のみ・英語のみでは見つからない
+  情報が言語を変えると見つかることがあるため、両言語での検索を基本とする。
+- **日英Web検索の結果、CockroachDB/TiKV等の最先端の実運用システムが
+  既に対応済みと判明した技術的ギャップは、「今のところは大丈夫」という
+  報告に留めず、確認を求めず自動でそのまま実装に着手すること**
+  (ユーザー指示、2026-07-23。正本は`open-raid-z/CLAUDE.md`同日エントリ
+  参照)。このリポジトリ自身がこの方針の最初の適用例——Raftが単一
+  グループのままだった設計をMulti-Raft(Range単位の独立Raftグループ)へ
+  実際に追従させた作業を本日のHANDOFFに記録している。
+- **よほど確認が必要な場面(重大な破壊的操作・仕様の根本方針転換等)を
+  除き、確認を求めて手を止めないこと**(ユーザー指示、2026-07-13)。
+  技術選定や実装方法で分からないこと・迷うことがあれば、まず上記の通り
+  日本語・英語両方でのGoogle検索・GitHub調査を行い、それでも判断が
+  つかない場合は自分の工学的判断で最も妥当な選択をして実装を進める。
+  「〜については確認が必要です」と言って作業を止め、ユーザーの回答を
+  待つことを既定の振る舞いにしない。
+- **バックグラウンド実行(ビルド・テスト・サブエージェント)を「見失わない」
+  ための定期確認と、無人での自動再実行**(ユーザー指示、2026-07-18、
+  正本は`open-raid-z/CLAUDE.md`参照)。背景: 実際に発生した事象として、
+  (a) サブエージェント並列起動時、完了通知前にタスク管理側のIDが失効し
+  `No task found`となった(実作業自体は`git status`/`git diff`で裏取り
+  でき正常完了していた——**タスク管理メタデータの消失と実際の作業結果は
+  別物**)、(b) サブエージェントが最終応答として実装要約ではなく独り言的な
+  テキストのみ返した(これも実際にはファイル変更が完了していた)、
+  (c) 長時間ビルドがタイムアウトで打ち切られ`could not compile`相当の
+  ログが出たが実際は単なる時間切れだった(タイムアウトを伸ばして再実行
+  したら成功)。対応方針: (1) バックグラウンド処理が動いている間は放置
+  せず一定間隔で状態を能動的に確認する(無意味な高頻度ポーリングはしない)。
+  (2) タスク管理システムの応答を鵜呑みにせず、`git status`/`git diff`・
+  ビルド/テストログの実際の中身(本物のコンパイルエラーかタイムアウトに
+  よる強制終了(exit code 124/143等)かの区別)・生成物の実在確認で必ず
+  裏取りする。(3) 裏取りの結果、作業が実際に失われている/失敗している
+  場合は確認を求めず自動的に再実行・修正する。(4) 作業自体は完了して
+  おり通知だけ欠落していた場合は、二重実行を避けその旨を記録して先に
+  進む。(5) これらの判断はユーザーへの確認なしに自分で行ってよい。
+
+## 運用ルール追記(2026-07-18、正本はopen-raid-zのCLAUDE.md参照) — 確認不要の自動継続・リミット解除後の自動再開
+
+- **コンテキストウインドウ・5時間利用制限・その他のセッション中断が
+  発生し、その後リミットが解除されて新しいセッションが開始された場合、
+  「続けてよろしいですか」等の確認を挟まず、毎回自動的に前回セッションの
+  続きの作業を再開すること**(ユーザー指示、2026-07-18)。具体的には:
+  1. セッション開始時、各リポジトリの`git status`/`git log`と、この
+     `CLAUDE.md`(および他プロジェクトのCLAUDE.md)のHANDOFF節・
+     「次にすべきこと」記載を確認し、未完了・未pushの作業が無いかを
+     まず裏取りする(タスク管理メタデータを鵜呑みにしない既存方針と
+     同じ姿勢で、実際のgit状態を確認する)。
+  2. 未完了作業が見つかった場合、ユーザーへの確認を求めず、そのまま
+     自動的に検証(build/test)→修正→コミット→pushまで完了させる。
+  3. 完了している場合は、各CLAUDE.mdの「次にすべきこと」「未着手・
+     未完成」に記載された次の項目へ確認なしに着手する(既存の
+     「未着手だからといって確認を求めて手を止めない」方針の延長)。
+  4. 「続けてよろしければそのまま自動開発を継続します」のような、
+     続行そのものを尋ねる確認は今後一切行わない(ユーザー指示、
+     2026-07-18)。作業内容の要約・進捗報告はしてよいが、それは
+     承認を求めるものではなく完了報告として書く。
+  5. こまめにコミット・pushしておくことで、次回セッションが「どこから
+     再開すべきか」を迷わず`git log`/CLAUDE.mdから機械的に判断できる
+     ようにしておく(区切りがついた時点で都度コミット・pushする既存
+     方針との組み合わせ)。
+
+
+## 運用ルール追記(2026-07-19、正本はopen-raid-zのCLAUDE.md参照) — 白画面バグ等を見逃さない検証徹底
+
+- **WEB/UIを持つ機能を実装した後は、ビルド成功・`cargo test`・curlでの
+  ステータスコード確認だけで「完了」と報告せず、実際に画面が正しく
+  表示される(白画面・レンダリング崩れ・コンソールエラーが無い)ところ
+  まで確認すること**(ユーザー指示、2026-07-19)。
+  1. ブラウザ操作が可能な環境では、実際にページを開いて表示内容
+     (見出し・本文・想定した要素の存在)とコンソールエラーの有無を
+     確認する。
+  2. ブラウザ操作ができない環境では、少なくとも`curl`等でHTMLボディの
+     中身を取得し、期待される文字列が実際に含まれているかを確認する
+     ——ステータスコード200だけを見て「動作確認済み」としない。
+  3. 白画面・エラー・期待した内容の欠落等の不具合が見つかった場合は、
+     確認を求めず自動的に原因調査・修正・再確認まで行う。
+  4. 本番ドメインが未取得・DNS未設定なだけの状態は上記の「白画面
+     バグ」とは別物であり、混同しない(`localhost`確認で代替可)。
+
+
+## 現状(このリポジトリ固有)・重要な引き継ぎ事項
+
+- **2026-07-23(続き2) HTAP(TiDB/SingleStore/Snowflake Unistore方式)の
+  ギャップを日英Web検索で発見・対応着手中(正本はopen-raid-z/CLAUDE.md
+  同日エントリ参照)**: ユーザー指示「Snowflake×CockroachDBハイブリッド
+  の最新動向を調査」を受け、この設計思想がHTAP(Hybrid Transactional/
+  Analytical Processing)という確立パターンとして実在すると判明
+  ([PingCAP: Real-World HTAP](https://www.pingcap.com/blog/real-world-htap-a-look-at-tidb-and-singlestore-and-their-architectures/))。
+  **発見したギャップ**: `aruaru-query::olap.rs::run_olap`は、OLAP
+  クエリのたびに`engine.snapshot_tables()`で**全テーブルを行ストアから
+  毎回フル再構築**する設計(`olap.rs`冒頭の「現段階の制約」に単一ノード
+  MPPである旨は明記されていたが、フル再構築であることの性能上の
+  トレードオフは未記載だった)。TiDB(TiKV行ストア→TiFlash列ストアへ
+  リアルタイムインクリメンタル同期)のような「変更差分だけ列ストアへ
+  反映する」設計にはなっていない。
+  **対応方針**: 既存の`dirty`集合(DUAL DATABASEミラー用、`persist_row`
+  で`(table, pk)`を記録)とは別に、テーブル単位の粒度で列キャッシュの
+  無効化を追跡する仕組みを追加し、変更の無いテーブルは前回のArrow
+  RecordBatchキャッシュを再利用、変更されたテーブルのみ再構築する
+  ——という現実的なスコープでのインクリメンタル同期を実装する(次の
+  HANDOFFエントリで実装完了を記録)。真のマルチノード分散HTAP
+  (TiKV/TiFlash間のネットワーク越しレプリケーション相当)は、
+  aruaru-distのRaftがまだ単一プロセス内(ネットワーク越し複製は
+  openraft統合待ち)であるため範囲外。
+
+- **2026-07-23(続き3) HTAP列キャッシュ`OlapCache`を実装完了**:
+  `crates/aruaru-query/src/engine.rs`に`olap_dirty_tables:
+  RwLock<HashSet<String>>`を新設(既存のDUAL DATABASEミラー用`dirty`
+  集合とは意図的に別集合——同じ集合を2つの消費者で共有すると片方が
+  `take`で先にクリアしもう片方が変更を見逃す実バグになるため分離)。
+  `persist_row`/`persist_delete`/`persist_schema`/`persist_drop`の
+  全てでテーブル名を記録、`is_olap_table_dirty`/`clear_olap_dirty`を
+  公開。`snapshot_table`(1テーブルのみ、全テーブル走査の
+  `snapshot_tables`を避ける)も追加。
+  `crates/aruaru-query/src/olap.rs`に`OlapCache`新設:
+  `refresh()`が変更のあったテーブルだけ`snapshot_table`+Arrow
+  `RecordBatch`再構築、変更の無いテーブルは行ストアに一切触れず
+  前回のキャッシュを再利用する。既存の`run_olap`(毎回全テーブル
+  フル再構築)は後方互換のため残置。
+  **検証**: `olap_cache_reuses_unchanged_tables_and_rebuilds_only_
+  dirty_ones`(新規)——2テーブル(`orders`/`customers`)を用意し、
+  `customers`だけを更新した後も`orders`が`is_olap_table_dirty`に
+  ならないこと、`customers`は正しく再構築され新しい行が反映される
+  こと、両方を実証。`cargo test -p aruaru-query`**41件全green**
+  (既存39件+新規2件)。
+  **正直な開示・スコープの限界**: (1) 粒度はテーブル単位——1行でも
+  変更されたテーブルはテーブル全体を再構築する(TiFlashのような
+  真の行単位インクリメンタル反映ではない)。(2) 単一プロセス内のみ
+  ——TiKV/TiFlash間のようなネットワーク越しの別ノードへの列レプリカ
+  配置は、aruaru-distのRaftが単一プロセス内実装のため範囲外。
+  - 次にすべきこと: (1) `aruaru-server`の本番経路への`OlapCache`配線
+    (現状は`aruaru-query`クレート内の新機能のみ、呼び出し元は未接続)、
+    (2) 行単位の真のインクリメンタル反映、(3) Multi-Raft
+    (`aruaru-dist::multi_raft`)との統合——Range単位でOLAP列キャッシュも
+    分割する余地がある。
+
+- **2026-07-23(続き4) 上記(2)「行単位の真のインクリメンタル反映」を
+  日英Web検索でTiFlashの実設計を調査の上、実装完了**: ユーザー指示
+  「そのギャップ(テーブル単位粒度という限界)に対する再設計方法を
+  日英で検索して開発に活かして」を受けて着手。
+  **調査結果**: TiFlashは「Delta Tree」という設計(B+木とLSM木の
+  ハイブリッド)を採用し、列エンジンを書き込み最適化領域(デルタ、
+  行ストア形式)と読み出し最適化領域(ベース、列ストア形式)に分割、
+  新規行データはまずデルタへ書かれ、後でバッチ変換されて列ストアへ
+  マージされる、と判明
+  ([TiFlash Overview](https://docs.pingcap.com/tidb/stable/tiflash-overview/)、
+  [TiDB internals: TiFlash column storage](https://internals.tidb.io/t/topic/590))。
+  SQL Serverの列ストアインデックスも同様の「デルタストア」(行ストア
+  形式で新規行を保持、後で列形式へマージ)を持つことも確認、業界横断で
+  確立した設計と裏付けが取れた。
+  **再実装**: `engine.rs`のOLAP追跡を、テーブル単位の`bool`集合
+  (`olap_dirty_tables`)から**行単位のpk集合**
+  (`olap_delta_pks: HashMap<table, BTreeSet<pk>>`)へ全面的に再設計。
+  スキーマ変更(CREATE/DROP TABLE)は別集合`olap_schema_dirty`で扱う
+  (列定義自体が変わるため行単位デルタでは対応できない)。
+  `snapshot_table`をpk込みで返すよう変更(`(cols, pks, rows)`、
+  `pks[i]`と`rows[i]`が対応)。新規`get_row(table, pk)`で1行だけの
+  再取得を可能にした。
+  `olap.rs`の`OlapCache`を「ベース(Arrow列バッチ+対応するpk配列)+
+  変更されたpk集合」を保持する設計へ書き換え。クエリのたびに:
+  (1) `arrow::compute::filter_record_batch`(列指向の軽量フィルタ
+  カーネル、文字列パース不要)でベースから変更されたpkの行を除去、
+  (2) 変更されたpkだけを`get_row`で読み直し(テーブル全体ではない)、
+  小さなデルタバッチを構築、(3) `arrow::compute::concat_batches`で
+  結合し次回のベースとして採用(即時コンパクション)。
+  **検証**: `olap_cache_incremental_merge_handles_update_delete_and_
+  insert_correctly`(新規)——3行のテーブルに対し1行更新・1行削除・
+  1行新規追加を行い、`SUM`が二重集計無く正しい値(古い値がベースに
+  残っていないこと)、`COUNT(*)`が正しい行数(削除が反映されている
+  こと)を実証。既存の`olap_cache_reuses_unchanged_tables_and_
+  rebuilds_only_dirty_ones`もAPI名を`has_pending_olap_delta`
+  (旧`is_olap_table_dirty`)へ追従して更新、green維持。
+  `cargo test -p aruaru-query`**42件全green**(前回41件+今回1件)。
+  `cargo test --workspace`(全クレート)リグレッション無し。
+  **正直な開示・スコープの限界(前回よりは縮小したが残っている)**:
+  (1) 単一プロセス内のみ——TiKV/TiFlash間のネットワーク越し列レプリカ
+  配置は引き続き範囲外(openraft統合待ち)。(2) 毎回即時コンパクション
+  する設計であり、TiFlashのように「デルタ層が一定サイズになるまで
+  複数バッチのまま保持し、閾値到達時にまとめてコンパクション」という
+  最適化はしていない——書き込みのたびに軽量なフィルタ処理は発生する
+  (ただし文字列→型付き配列変換という重い処理は変更行数分だけで済む
+  ため、既存の「毎回全テーブルをフル再構築」より確実に軽い)。
+  - 次にすべきこと: (1) `aruaru-server`の本番経路への`OlapCache`配線
+    (引き続き未接続)、(2) デルタ層のバッチ保持+閾値コンパクション
+    (現状は毎回即時コンパクション)、(3) Multi-Raftとの統合。
+
+- **2026-07-23 Multi-Raft(CockroachDB/TiKV方式)を新規実装
+  ——「最先端追従の方針」の最初の適用例**: ユーザーから、単一Raftグループ
+  のままでは将来のスケール限界になり得るという指摘に対し「今は問題ない」
+  という報告で終わらせず、CockroachDB/TiKVが既に採用しているMulti-Raft
+  方式へ実際に追従するよう指示を受けた(日英Web検索でRaftが2026年時点
+  でも最良のデフォルト選択と確認済み、詳細は
+  [systemdesignhandbook.com](https://www.systemdesignhandbook.com/guides/raft-consensus-algorithm/))。
+  1. **発見した実欠落**: `shard::topology::ClusterTopology`(Range単位の
+     ルーティング表、CockroachDB方式のキー空間分割データ構造)と
+     `raft::node::RaftNode`(単一Raftグループの合意ロジック)は、
+     以前から両方存在していたが**互いに一度も接続されたことがなかった**
+     ——前者はルーティング計算のみのデータ構造、後者は常に単一グループ
+     として使われていた。「Multi-Raftの土台となる部品は揃っていたが
+     実際には繋がっていなかった」という、このエコシステムで繰り返し
+     見つかる欠陥パターンの同種の実例。
+  2. **`crates/aruaru-dist/src/multi_raft.rs`新設**: `MultiRaftCluster<A>`
+     が`ClusterTopology`と`HashMap<range_id, Arc<RaftNode<A>>>`を保持し、
+     `propose(key, command)`がkeyの担当Rangeを解決してそのRange専用の
+     独立したRaftグループへ提案を委譲する。`split(range_id, split_key,
+     applier)`でRange分割時に新しい独立したRaftグループを立てる
+     (CockroachDBのRange分割と同じ発想)。
+  3. **正直な開示・スコープ**: `RaftNode`自体は単一プロセス内の
+     ログ/適用セマンティクスのみを提供し(ネットワーク越しの選挙/複製RPC
+     はopenraftに委譲する計画、`raft/mod.rs`参照)、本モジュールもその
+     制約を引き継ぐ——複数の物理ノードへの実際のネットワーク複製は
+     まだ無い。ここで実証したのは「Range単位で完全に独立した合意
+     グループが並行して進行できる」という構造的性質そのもの。また、
+     Range分割時の新グループは空のログから始まり、分割元の状態機械
+     スナップショット転送は今回未実装(次回以降の課題)。
+  4. **検証**: `cargo test -p aruaru-dist multi_raft`**3件全green**——
+     核心となる`split_ranges_progress_independently_like_cockroachdb_
+     multi_raft`は、Range分割後に一方のRangeへ3件コミットしても
+     もう一方のRangeのcommit_indexが不変であることを実証(単一グローバル
+     Raftグループでは得られない、Multi-Raftならではの独立性の直接証明)。
+     `cargo test --workspace`**リグレッション無し全green**
+     (aruaru-dist 27→30件、他クレート含め既存分すべて維持)。
+  - 次にすべきこと: (1) Range分割時の状態機械スナップショット転送、
+    (2) 実際のクエリエンジン(`aruaru-query::QueryEngine`)からの
+    `MultiRaftCluster`利用(現状は`aruaru-server`の本番経路には未配線、
+    疎結合コンポーネントとして実装した段階——`snapshot_pairing`/
+    `raid_z_backend`と同じ既存の段階的アプローチ)、(3) ネットワーク越し
+    の複製RPC(openraft統合、`raft/mod.rs`の既存計画)。
+
+- **2026-07-23(続き) recordsize不一致バグを修正(拡張要件(2)のZFS
+  ↔DB関連性で指摘されていた推奨事項の実施漏れ)**: 日英Web検索で
+  「ZFS/RAID-Zのrecordsizeをdatabaseのブロックサイズ(PostgreSQLは
+  8KB)に合わせないと書き込み増幅が発生する」という2026年時点でも
+  有効な推奨事項を再確認したところ
+  ([tech-champion.com](https://tech-champion.com/database/postgresql/zfs-on-postgres-recordsize-mismatch-and-write-amplification/))、
+  `crates/aruaru-dist/src/raid_z_backend.rs`の`OpenRaidZSnapshotBackend::new`
+  が`CHUNK_SIZE=4096`を固定でハードコードしており、PostgreSQLの8192バイト
+  ページと不一致のままだったことを発見・修正(`CHUNK_SIZE=8192`へ変更)。
+  `cargo test -p aruaru-dist --features open_raid_z`27件全green
+  (既存の`real_raft_commit_triggers_real_raid_z_snapshot`含め回帰無し)。
+
+- **2026-07-20(4) DUAL DATABASEミラーを全行ダンプ→差分抽出へ最適化
+  (前回HANDOFFの次回候補(b)を完了)**: `aruaru_query::QueryEngine`に
+  `dirty: RwLock<BTreeSet<(String, Vec<u8>)>>`を新設し、`persist_row`
+  (INSERT/UPSERT/UPDATEの単一集約点)で書き込みのたびに`(table, pk)`を
+  記録するようにした。`aruaru_commit`成功時、従来の
+  `export_all_rows_as_json`(常に全テーブル全行を書き出す)を
+  `export_dirty_rows_as_json`に置き換え——dirty集合の中身だけを
+  ミラーへ渡し、呼び出し後に集合を`std::mem::take`でクリアする。
+  - **未登録時のメモリリーク回避**: 当初、dirty集合のクリアを
+    `if let Some(hook) = ...`ブロック内(=フック登録時のみ)に置いて
+    いたが、`DUAL_DATABASE_URL`未設定でフックが無い環境では
+    コミットのたびに集合が際限なく肥大化する実バグになると気づき、
+    フックの有無によらず毎コミット必ずクリアする形に修正した。
+  - **既知の限界(正直な開示)**: (a) `persist_delete`(DELETE文)は
+    dirty集合に追加しない——現行の`MirroredMutation`は「値」を運ぶ
+    形で削除(tombstone)を表現できないため、対応するには将来
+    スキーマ拡張が必要(課金アイテム付与のような追記型ワークロードを
+    主眼とした設計判断)。(b) `load_from`(fjallからの起動時復元)も
+    `persist_row`経由でdirty集合に加わるため、再起動後の最初の
+    `aruaru_commit`は復元した全行を(実際には無変更でも)再送する
+    フルダンプ相当になる——安全側(過剰送信はデータ欠落より無害)に
+    倒した意図的な設計。
+  - **検証**: `commit_hook_only_receives_rows_changed_since_previous_
+    commit`(新規、2回目のコミットで無関係な行が再送されないこと・
+    3回目の無変更コミットで空になることを実証)を含む
+    `cargo test -p aruaru-query`(41件)・`cargo test --workspace`
+    全green。さらにWSL2の実PostgreSQL(`aruaru_dual_diff_test`
+    データベース)に対し`cargo test -p aruaru-dist -- --ignored`
+    (実DB往復テスト)を再実行しgreenを確認、加えて実`aruaru-server`
+    バイナリを`DUAL_DATABASE_URL`付きで起動しpgwire経由で複数回
+    コミットを発行、ミラー先PostgreSQLの`aruaru_dual_mirror`テーブルの
+    行数増分が「今回変更した行数」と一致し、無関係な既存行が重複挿入
+    されないことを`psql`で直接確認した(型チェックのみでの完了報告
+    ではない)。
+  - 次回以降の候補: (a) fire-and-forgetから真の同期ミラーへの格上げ
+    (`execute`のasync化)、(b) 削除(tombstone)のミラー伝播対応、
+    (c) 本番運用を見据えた`DUAL_DATABASE_URL`のTLS化・認証情報の秘匿。
+
+- **2026-07-20(3) DUAL DATABASE構成を実PostgreSQLで一気通貫検証(前回HANDOFFの
+  次回候補(a)を完了)**: この開発環境にDockerは無いが、WSL2に実
+  PostgreSQL 18(`apt`パッケージ、`sudo`パスワード不要な`wsl -u root`
+  経由)が導入済みと判明したため、それを使って実接続検証を行った
+  (推測・型チェックのみでの「検証済み」報告ではない)。
+  1. `cargo test -p aruaru-dist -- --ignored`を実WSL2 PostgreSQLへの
+     `DATABASE_URL`付きで実行 → **green**(`mirror_then_latest_and_
+     at_commit_round_trip_against_real_postgres`)。
+  2. 実`aruaru-server.exe`を`DUAL_DATABASE_URL`(WSL2 PostgreSQL、
+     ミラー先DB)+`ARUARU_USERS`(pgwire SCRAM認証用)を設定して起動し、
+     WSL2側の`psql`から**WindowsホストのIP(WSLのデフォルトゲートウェイ)
+     経由でpgwire(:15434)へ実接続**、`CREATE TABLE`→`INSERT`→
+     `SELECT aruaru_commit(...)`を実行。
+  3. 1回目コミット(`qty=1`)・2回目コミット(`UPDATE`→`qty=5`で再コミット)
+     を発行し、`fire-and-forget`のミラーが両方とも別プロセスの実
+     PostgreSQL(`aruaru_dual_mirror`テーブル)へ到達していることを
+     `psql`で直接確認。**VersionlessAPI**(`ORDER BY committed_at DESC
+     LIMIT 1`)が最新値`qty=5`を返すこと、**Git版管理**
+     (`WHERE commit_id = '<1回目のcommit_id>'`)が過去値`qty=1`を
+     返すこと(最新に上書きされていない)の両方を実データで確認した。
+  - **正直な開示**: (a) この検証はDockerではなくWSL2ネイティブ
+    PostgreSQLを使った(この環境にDockerが存在しないため)。手順自体は
+    Docker Composeでも同様に再現可能なはずだが、Docker環境そのものでの
+    確認ではない。(b) fire-and-forgetの非同期タイミング依存のため、
+    `psql`での確認前に`sleep 2`を挟んだ(ミラーが即座ではなく数十〜数百
+    ミリ秒後に反映される設計上の性質であり、バグではない——
+    `set_commit_hook`のdoc参照)。(c) 検証後、起動していた
+    `aruaru-server.exe`プロセス・一時データディレクトリ・検証用
+    PostgreSQLデータベース(`aruaru_dual_test`/`aruaru_dual_live`)は
+    このマシンに残したまま(次回セッションでの再検証に使える。不要になれば
+    `DROP DATABASE`で削除してよい)。
+  - 次回以降の候補: (a) fire-and-forgetから真の同期ミラーへの格上げ
+    (`execute`のasync化)、(b) 全行ダンプから差分抽出への最適化、(c) 本番
+    運用を見据えた`DUAL_DATABASE_URL`のTLS化・認証情報の秘匿(現状は
+    環境変数に平文、開発検証用としては妥当)。
+
+- **2026-07-20(2) DUAL DATABASEミラーを`aruaru-server`の実コミットパスへ配線
+  — 前回HANDOFFの次回候補(a)(b)を実施**: `aruaru_query::QueryEngine`に
+  `commit_hook`(`set_commit_hook`)を新設し、`aruaru_commit`成功直後に
+  `(commit_id, 全テーブルの現在行(table_name, row_key, payload_json))`で
+  同期・非ブロッキングに呼ばれるようにした。`aruaru-server/src/main.rs`は
+  起動時に環境変数`DUAL_DATABASE_URL`が設定されていれば実PostgreSQLへ
+  接続・`ensure_schema()`した上でこのフックを登録し、以後すべての
+  `aruaru_commit`(pgwire経由・GraphQL経由・migrate_run経由いずれも)で
+  `DualDatabaseMirror`への書き込みが自動的に発生するようになった
+  (未設定時はこれまで通りミラー無効、既存動作は一切変わらない)。
+  - **正直な開示(重要な設計上のトレードオフ)**: フック自体は
+    `tokio::spawn`によるfire-and-forgetであり、`open-web-server-ledger::
+    multi_region`が定めた「全レグの完了を待ってから呼び出し元に返す」
+    という厳密な同期ポリシーからの**意図的な逸脱**である。理由は
+    `QueryEngine::execute`が同期関数でありpgwireの同期経路からも呼ばれる
+    ため、フック内で`block_on`すると`Cannot start a runtime from within a
+    runtime`のデッドロック/パニックリスクがあるため。詳細な設計判断は
+    `crates/aruaru-query/src/engine.rs`の`set_commit_hook`docコメントに
+    記載。将来`execute`自体をasync化する際は、この逸脱を解消し真の
+    同期ミラーへ格上げすることが望ましい。
+  - **粒度**: 変更行のみの差分抽出ではなく、コミット時点の全テーブル
+    全行を毎回書き出す(`export_all_rows_as_json`)。`aruaru_commit`
+    自体が全テーブルを1つのProlly Treeへスナップショットする設計
+    (`snapshot_root`)と同じ粒度であり、`aruaru-backup`のフルダンプ方式
+    と同じ既知の限界(将来、真の差分抽出への最適化余地あり)。
+  - **検証**: `commit_hook_fires_with_commit_id_and_current_rows`/
+    `commit_without_hook_registered_still_succeeds`(`aruaru-query`、
+    新規2件)、`cargo build -p aruaru-server`成功(既存の無関係な
+    dead_code警告1件のみ)、`cargo test --workspace`全green。実
+    PostgreSQLへの到達確認はこの開発環境では引き続き未実施
+    (`DATABASE_URL`/`DUAL_DATABASE_URL`いずれも到達可能なPostgreSQLが
+    無いため——前回HANDOFFと同じ既知の制約)。
+  - 次回以降の候補: (a) 実PostgreSQL/Docker環境での`DUAL_DATABASE_URL`
+    起動確認・`--ignored`統合テスト実行、(b) fire-and-forgetから真の
+    同期ミラーへの格上げ(`execute`のasync化を要する大規模な設計変更)、
+    (c) 全行ダンプから差分抽出への最適化。
+
+- **2026-07-20 DUAL DATABASE構成(aruaru-db × PostgreSQL)を新規実装
+  — 拡張要件(4)「DB書き込みの四重化」の②、`open-web-server-ledger`
+  (①PostgreSQL WAL・③マルチリージョン・④監査ログ)と対になる本リポジトリ側の
+  責務**: `crates/aruaru-dist/src/dual_database.rs`を新設。
+  - `DualDatabaseMirror::mirror()`が、aruaru-db側で既に確定した
+    ミューテーション(`MirroredMutation`: table_name/row_key/payload_json/
+    commit_id/committed_at)を実PostgreSQLへ**同期的に**ミラーする
+    (`open-web-server-ledger::multi_region`と同じ「全レグの完了を待って
+    から呼び出し元に返す」判断——金融データにeventual consistencyは
+    許されないという既存方針の踏襲)。
+  - **VersionlessAPI + Git版管理の両立**: ミラー先テーブルは
+    `(table_name, row_key, commit_id)`を保持し、`latest()`は
+    `committed_at DESC LIMIT 1`で「バージョンレス」な最新値、
+    `at_commit()`は`commit_id`一致行で「特定コミット時点」の値を返す
+    ——aruaru-db本体の`SELECT ... AS OF COMMIT`(2026-07-13実装済み)と
+    同じ意味論を、ミラー先のPostgreSQL単体からも再現できる。
+  - **冪等性**: `idempotency_key`(`SHA-256(table_name\0row_key\0
+    commit_id)`)に一意制約を張り`INSERT ... ON CONFLICT DO NOTHING`
+    (`postgres_wal.rs`/`multi_region.rs`と同じ形状)。
+  - **正直な開示**: (a) 実PostgreSQL接続での検証は未実施(この開発環境に
+    到達可能なPostgreSQLが無いため、`postgres_wal.rs`と同じ既知の制約)
+    ——SQL文字列・冪等性キー導出ロジックの単体テスト8件(オフラインで
+    検証可能な範囲)と、`DATABASE_URL`環境変数がある場合のみ動く
+    `#[ignore]`統合テスト1件の2段構え。(b) aruaru-db側のコミットと
+    PostgreSQL側のミラーは独立操作であり、真の2フェーズコミットでは
+    ない(`mirror()`失敗時にaruaru-db側をロールバックする手段は無い
+    ——`multi_region.rs`と同じスコープの限界、失敗は`DualDatabaseError`
+    で呼び出し側へ返す設計)。(c) `DualDatabaseMirror`をどこから
+    呼び出すか(`aruaru-server`のコミットパスへの実配線)は今回未実施
+    ——このパスは`aruaru-dist`内の独立コンポーネントとしての実装に
+    留めた(`snapshot_pairing`/`raid_z_backend`と同じ、まず疎結合な
+    コンポーネントとして実装してから呼び出し元へ配線する既存の
+    段階的アプローチ)。
+  - **検証**: `cargo test -p aruaru-dist`(26 passed, 1 ignored)、
+    `cargo test --workspace`引き続きgreen。
+  - 次回以降の候補: (a) `aruaru-server`のコミットパス(`admin.rs`の
+    `SELECT aruaru_commit(...)`実行後)から`DualDatabaseMirror::mirror()`
+    を呼ぶ実配線、(b) 環境変数(`DUAL_DATABASE_URL`等)経由でのPostgreSQL
+    接続先設定・起動時`ensure_schema()`呼び出し、(c) 実PostgreSQL/Docker
+    が使える環境での`--ignored`統合テスト実行確認。
+
+- **2026-07-18 `propose_commit`未使用警告を調査(コード変更は見送り、
+  無人自動開発中の判断)**: `cargo build --workspace`のdead_code警告
+  (`crates/aruaru-server/src/cluster.rs`の`propose_commit`が未使用)を
+  追ったところ、`admin.rs::migrate_run`(ワイヤ経由データ取り込み
+  ハンドラ)が取り込み後のコミットを`state.engine.execute("SELECT
+  aruaru_commit(...)")`で**直接ローカル実行**しており、Raft経由の
+  `cluster::propose_commit`(`admin.rs::cluster_propose`が`propose_write`
+  で使っているのと同じパターン)を一切経由していないことを発見した。
+  一見、open-easy-webで見つけた「配線漏れ」と同種のバグに見えたが、
+  精査した結果**安易に直すべきではないと判断した**: `migrate_run`が
+  行う実データの取り込み(`engine.ingest_table`)自体がそもそも
+  ローカル限定で、Raftによる複製を経由していない。この状態で
+  コミットマーカーだけを`propose_commit`でRaft複製するよう変更すると、
+  「実データは複製されていないのに、コミットの事実だけは複製された」
+  という、現状より悪い中途半端な整合性を生む(フォロワーには存在しない
+  データへの「コミット済み」マーカーだけが複製される)。分散DBの
+  整合性に関わる箇所を推測で変更するリスクを避け、コード変更はせず
+  この判断根拠を記録するに留めた。
+  次回検討すべきこと: `migrate_run`によるバルク取り込みを、そもそも
+  非クラスタ運用限定の機能として明示的にドキュメント化するか、
+  あるいは取り込んだデータ自体もRaft経由で複製する本格的な対応を
+  取るか、方針を決めた上で実装する。
+
+- **2026-07-17 ZFS互換/ACID互換データ層をRust-JSON(独立リポジトリ)へ移行**:
+  ユーザー指示("open-raid-z arurau-db のZFS互換とACID互換で今まで、JSON
+  だった部分を今後は、RUST版 JSON Rust-JSONに置き換えて下さい")に基づき、
+  `serde_json`直接依存だった箇所を新設の
+  [`Rust-JSON`](https://github.com/aon-co-jp/Rust-JSON)(`F:\open-runo\Rust-JSON`
+  へのpath依存、`rust-json`クレート)へ置き換えた。
+  - まず`open-raid-z`本体(`open_runo_zfs_source`)を調査したが、ZFS/ACID
+    コア(`open_raid_z_core`)に`serde_json`依存自体が存在しなかった
+    (チェックサム等は生バイト列でJSONを経由しない) — 移行対象は
+    `aruaru-db`のみだった。
+  - `Rust-JSON`側に型付き厳密モードAPI(`from_slice_strict::<T>`/
+    `from_str_strict::<T>`/`to_vec_strict`/`to_string_strict`/
+    `to_string_pretty_strict`)を追加(既存の`parse_strict`は`Value`専用
+    だったため、構造体を直接デシリアライズする既存呼び出し箇所には
+    使えなかった)。これらは全て`serde_json`へそのまま委譲するため、
+    出力バイト列は`serde_json`直接呼び出しと完全に同一 —
+    `crates/aruaru-core/src/storage/mod.rs`のZFS互換チェックサム層
+    (書き込みバイト列のSHA-256を検証する仕組み)がバイト列の同一性に
+    依存しているため、この互換性は必須要件だった。
+  - 移行箇所: `crates/aruaru-core/src/storage/mod.rs`(`StoredSchema`/
+    行データの保存・読み出し、`StorageError::Serde`の内部型を
+    `rust_json::RustJsonError`に変更)、`crates/aruaru-dist/src/raft/
+    command.rs`(`Command::encode`/`decode`、Raftログのワイヤ形式)、
+    `crates/aruaru-backup/src/lib.rs`(`BackupManifest`のMANIFEST.json
+    読み書き、S3/ローカル両経路)、`crates/aruaru-query/src/engine.rs`
+    (`QueryResponse`の冪等性キャッシュ読み書き)。
+  - 各クレートの`Cargo.toml`に`rust-json.workspace = true`を追加、
+    ワークスペースルート`Cargo.toml`に`rust-json = { path =
+    "../Rust-JSON" }`をpath依存として追加(`aruaru-dist`の
+    `open_raid_z_core`path依存と同じパターン、両リポジトリが
+    `F:\open-runo`直下に並んでいる前提)。
+  - **検証**: `cargo build --workspace`成功(既存の
+    `propose_commit`未使用警告1件のみ、無関係)。`cargo test
+    --workspace`実行、2件failed(`aruaru-backup`の
+    `s3::tests::new_requires_credentials_from_env`/
+    `presign_put_produces_a_signed_url_for_the_prefixed_key`)を
+    `cargo test -p aruaru-backup --lib -- --test-threads=1`で
+    切り分け再実行したところ全15件green —
+    並列テスト実行時のAWS環境変数競合による既存の非決定性であり、
+    今回のJSON移行によるものではないことを確認した(このリポジトリの
+    `s3.rs`自体には一切手を入れていない)。
+  - **意図的に置き換えなかった箇所**: `crates/aruaru-core/src/
+    storage/mod.rs`内のテストコード(307・331・360行目付近)の
+    `serde_json::to_vec`はチェックサム層自体を検証するために意図的に
+    生バイト列を組み立てているテストフィクスチャであり、移行対象外。
+    `crates/aruaru-registry/src/crawler.rs`(`reqwest`の`.json::<Value>()`)・
+    `admin/src-tauri`・`aruaru-server/src/admin.rs`は`from_str`/parse呼び
+    出しを持たず`Value`型としての使用のみのため対象外(調査済み)。
+  - 次にすべきこと: 特に緊急の課題は無し。旧`open-runo-rustjson`
+    (open-runo/poem-cosmo-tauri側)は当面参照実装として残置、実際に
+    aruaru-db側が新クレートへ切り替わったことを確認できたので、
+    旧クレート撤去の検討はopen-runo/poem-cosmo-tauri側のCLAUDE.mdで
+    改めて判断する。
+
+- **2026-07-15 コードヘルス監査 — audit only, no changes**:
+  `cargo build --workspace`/`cargo test --workspace`を実行し、ビルド成功
+  (警告1件: `aruaru-server`の`propose_commit`未使用、実害なしの
+  dead_code警告。加えて`aruaru-backup`の増分コンパイルキャッシュへの
+  アクセス拒否ノートが出たが再ビルドに影響なし)・全110テストgreen
+  (2件ignored)を確認。`git status`はクリーン、修正すべき壊れたビルド・
+  失敗テスト・小規模な欠落は見つからなかったため、コード変更は
+  行っていない。
+
+- **2026-07-14 pgwire拡張プロトコル(prepared statement)対応 —
+  フレームワークとしての実用性ギャップを解消**: open-web-server連携の
+  横断的な実用性調査でユーザーから指摘された「`describe_portal`が
+  常に空列リストを返すため多くのORM/ドライバのデフォルト経路が
+  失敗する」という問題に対応。`aruaru-wire`の`do_describe_statement`/
+  `do_describe_portal`を、**クエリを一切実行せず**
+  `aruaru_query::parser::parse`の構文解析結果+新規
+  `QueryEngine::table_columns`(スキーマ参照のみ)から列名を解決する
+  方式に書き換え。`Select`/`SelectAsOf`はテーブルの実スキーマから、
+  `AruaruLog`・4つのGit-on-SQL関数(`aruaru_branch`/`checkout`/
+  `commit`/`merge`)は`engine.rs`にハードコードされた既知の固定列形状
+  (関数名と同名の単一列)から、それぞれ列情報を構築する。書き込み文は
+  空列リストのまま(コマンドタグのみで実害無し)。**実行を伴わない設計
+  のため、`SELECT aruaru_commit(...)`のような副作用を持つ関数呼び出しを
+  誤って二重実行するリスクが構造的に存在しない**。
+  **検証**: 実`aruaru-server`を起動し`sqlx`の`query_as`/`.bind()`
+  (実際にORM/ドライバの多くが使う拡張プロトコル経路)で新規テスト2本
+  (複数列SELECTの実デコード確認、`aruaru_commit`が拡張プロトコル経由で
+  正確に1回だけコミットログに追加されることの確認)を実行、green。
+  `cargo test --workspace`(全既存テスト、110件)も引き続きgreen。
+  `open-runo`側の既存`aruaru_as_of_commit`統合テスト(Simple Query
+  プロトコル経由の`AruaruDbBackend`)にも回帰が無いことを再確認済み。
+  次回パスがすべきこと: 特に緊急の課題は無い。残るギャップは
+  `select_as_of`が列射影(`SELECT col1, col2`)を無視し常にフルROWを
+  返す点(低優先度、呼び出し側でインデックス指定して回避済み)。
+
+- **2026-07-13(サニティスイープ、ドリフト無しを再確認)**: open-easyweb/
+  open-web-server連携強化パスの一環として`cargo test --workspace`を
+  再実行、全件green(ignoredも無し)を確認。さらに`cargo build -p
+  aruaru-server`で実バイナリをビルドし、`open-runo`側の`#[ignore]`統合
+  テスト(`as_of_commit_returns_the_old_value_through_the_real_pgwire_
+  endpoint`、下記の`AS OF COMMIT`読み出しクエリの一気通貫検証)を実際に
+  この実バイナリに対して実行し、成功することを再確認した(詳細は
+  `open-runo`側の同日付CLAUDE.md HANDOFF参照)。本リポジトリ側のコード
+  変更は無し。
+- **2026-07-13: `AS OF COMMIT` 読み出しクエリを追加(open-web-server拡張要件(1)
+  「VersionLessAPI + Git版管理ハイブリッド」の読み出し側、`open-web-server`
+  側から依頼された調査・実装)**: `open-web-server/CLAUDE.md`が指摘していた
+  「commit_idを指定して過去状態を問い合わせるAPIがopen-web-server側に無い」
+  というギャップの、**このリポジトリの責務範囲(ストレージ/SQL層)における
+  実装**。既存の`aruaru_commit`(`aruaru-query::engine::QueryEngine`)が
+  `snapshot_root()`で全テーブルをProlly Treeへスナップショットし
+  `VersionController::commit`でcommit_idを発行する仕組みに対し、対応する
+  **読み出し**が存在しなかった。
+  - `crates/aruaru-core/src/version/mod.rs`: `VersionController::get_commit_by_str(id: &str) -> Option<Commit>`
+    を新設(従来は`log()`/`head()`経由の間接参照しかなかった)。
+  - `crates/aruaru-query/src/parser.rs`: `Statement::SelectAsOf { table, filter,
+    commit_id }`を新設。`SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+    '<commit_id>'`をパースする(内部のSELECT部分は既存`parse_select`を再帰
+    呼び出しして流用)。
+  - `crates/aruaru-query/src/engine.rs`: `select_as_of`を実装。
+    `version.get_commit_by_str(commit_id)`でcommitの`root_hash`を取得し、
+    `ProllyTree::from_root(root_hash, self.store.clone())`(**既存のAPI**
+    ——`ProllyTree`は元々任意のroot_hashから開けるようになっていたが、
+    `QueryEngine`側でそれを使う経路が無かった)でその時点のツリーを再構築、
+    `table\0pk`キーで`get()`する。キー形式は`snapshot_root()`と完全に
+    揃えてある。テーブルが現存すれば列名を引き継ぎ、無ければ`col0`/`col1`.. の
+    汎用列名にフォールバックする(過去データの読み出し自体は優先)。
+  - **検証(実データでの一気通貫テスト)**: `as_of_commit_returns_the_value_from_that_commit_not_the_latest`
+    (`engine.rs`)。同一キー(`sword`)に対し `qty=1`でコミット→`qty=5`に更新して
+    再コミット→最新状態は`qty=5`だが、**最初のcommit_idを指定した`AS OF
+    COMMIT`クエリは`qty=1`を返す**ことを実証(型チェックのみでの「完了」
+    報告ではなく、実際に異なる値が返ることを確認)。存在しないcommit_idは
+    エラーになることも確認。`cargo test -p aruaru-query`は新規1件を含む
+    全37件green。
+  - **正直なスコープの限界**:
+    1. **単一行のみ**: `WHERE`句でPKを特定できる場合のみ対応。全表スキャンの
+       `AS OF`(`WHERE`無し)は今回未対応(`ProllyTree`にテーブル横断の
+       効率的prefixスキャンAPIが今回追加されていないため)。
+    2. **pgwireへの配線は未実施**: `open-runo`は`aruaru-db`に対して
+       pgwire(:5433)経由の汎用KVテーブル操作(`open-runo-db::aruaru::
+       AruaruDbBackend`、`put`/`get`/`delete`/`list`のみ)で通信しており、
+       commit/バージョンという概念自体をpgwireプロトコル越しには一切
+       やり取りしていない。今回追加した`AS OF COMMIT`構文はSQLパーサー
+       レベル(`aruaru-query`)の機能であり、`aruaru-server`のpgwireハンドラ
+       (`aruaru-wire`)がこの新構文のクエリをそのまま透過させるかどうかは
+       未検証(pgwireは基本的に任意のSQL文字列をクライアントから受け取り
+       `QueryEngine::execute`に渡す設計のため、原理上は動くはずだが実際の
+       pgwireクライアント(psql等)からの実行確認はしていない)。
+    3. **open-runo/open-web-server側の配線は未着手**: `open-runo-router`に
+       `GET /api/db/:table/:key/at/:commit_id`相当のハンドラを追加し、内部で
+       上記SQLを組み立てて`aruaru`バックエンドへ投げる、という配線は
+       このパスでは実施していない(cross-repo作業であり、`open-web-server`
+       側のCLAUDE.md HANDOFFに詳細判断根拠を記載)。
+  - 次回以降の候補: (a) pgwire実クライアントからの`AS OF COMMIT`クエリの
+    実行確認、(b) `open-runo-router`への`GET .../at/:commit_id`ハンドラ追加、
+    (c) 全表スキャンの`AS OF`対応。
+
+  - **追記(同日、open-runo側セッションで(a)(b)とも完了)**: 上記(a)
+    「pgwire実クライアントからの`AS OF COMMIT`実行確認」と(b)
+    「`open-runo-router`への`GET .../at/:commit_id`ハンドラ追加」は
+    同日中に`open-runo`リポジトリ側のセッションで実施・実バイナリ検証
+    済み(詳細は`open-runo`の同日CLAUDE.md HANDOFFエントリ参照)。
+    その過程で本リポジトリの`aruaru-wire`/`aruaru_query::QueryEngine`
+    に起因する2つの実バグが判明した(**本リポジトリの責務範囲だが
+    open-runo側の統合テストで初めて顕在化した**、参考のため記録):
+    (1) `aruaru-wire`の`ExtendedQueryHandler::describe_portal`が常に
+    空の列リストを返す(動的スキーマのためRowDescriptionはExecute時
+    確定)ため、拡張プロトコル(prepared statement)経由で行データを
+    持つ`SELECT`を実行するクライアントは`ColumnIndexOutOfBounds`で
+    失敗する——`INSERT`/`DELETE`等コマンドタグのみの文は影響なし。
+    シンプルクエリプロトコル(`SimpleQueryHandler`)経由なら正しく
+    動く。open-runo側は該当する読み出し系メソッドをシンプルクエリ
+    プロトコル(`sqlx::raw_sql`)へ切り替えて回避したが、
+    **拡張プロトコルを使う他クライアント(psql自体はシンプルクエリの
+    ため影響なし、だが多くのORM/ドライバはデフォルトで拡張プロトコル
+    を使う)は同じ問題に当たる可能性が高い**——`aruaru-wire`の
+    `describe_portal`/`describe_statement`が真に空を返すしかないのか
+    (動的スキーマである以上は構造的な制約)、それとも簡易的な型推論
+    (例: 実行時に一度執行してから記述する、または既知のテーブルには
+    静的スキーマを返す)で改善できないかは、本リポジトリ側で改めて
+    検討する価値がある。
+    (2) `select_as_of`は`SELECT`の列リストを無視し常にフルROWを返す
+    (列名だけは要求に応じて解決するが、射影はしない)——将来
+    `SELECT col1, col2 FROM ... AS OF COMMIT ...`のような部分列指定を
+    厳密にサポートする場合は`select_as_of`内で明示的な射影処理が必要。
+    現状は呼び出し側(open-runo)が列インデックスを直接指定することで
+    回避しているが、本質的な修正ではない。
+
+- **2026-07-12: ZFS互換チェックサム層を追加(ZFS互換 + ACID互換のハイブリッド、
+  ユーザー指示)**: `crates/aruaru-core/src/storage/mod.rs`に、open-raid-z
+  (`open_raid_z_core::checksum`)と**アルゴリズム・型ともに完全同一**の
+  SHA-256チェックサム(`compute_checksum`)を追加。`PersistentStore`に
+  新パーティション`__checksums`を追加し、`save_row`で書き込みバイト列の
+  チェックサムを必ず記録、`scan_table`で読み込み時に再検証(不一致は
+  `StorageError::ChecksumMismatch`、黙って壊れたデータを返さない)。
+  ZFSの`zpool scrub`に相当する`scrub()`メソッドも追加(全行を検証し
+  破損箇所の一覧を返す、最初の不一致で打ち切らない)。既存のACID
+  トランザクション層(BEGIN/COMMIT/ROLLBACK、Git-on-SQLコミット)とは
+  直交する保証(ACID=正しい順序で確定、チェックサム=保存後にバイトが
+  破損していない)。チェックサム未記録の既存データは検証をスキップし
+  後方互換を維持。単体テスト4件追加(破損検出・scrub複数破損検出・
+  後方互換)。**検証**: `compute_checksum`単体は分離クレートで実行し
+  標準SHA-256テストベクタ(空文字列)と一致することを確認済み。
+  `PersistentStore`本体(fjall統合部分)は、このサンドボックスの
+  rustc 1.75では`fjall`自体がrustc 1.76+を要求するため(edition2024とは
+  別の、より根本的なツールチェーン制約)実ビルド確認ができなかった。
+  既存の動作実績あるパターン(`data.insert`/`data.prefix`等)を踏襲した
+  最小限の追加のため目視レビューでは問題なしと判断したが、実CI/実
+  ツールチェーンでの`cargo test -p aruaru-core`確認を推奨。
+
+- **2026-07-10 に重大な問題を発見・修正**: `main`ブランチの`Cargo.toml`が
+  ワークスペースメンバーとして `crates/aruaru-query` / `aruaru-wire` /
+  `aruaru-registry` / `aruaru-server`(サーバー本体バイナリ)を参照していたが、
+  実際のディレクトリが存在せず `cargo check --workspace` が起動すらしない
+  状態だった。調査の結果、`origin/backup-before-github-merge-20260705`という
+  **mainと共通の祖先を持たない別ブランチ**に、これら4クレートを含む完全な
+  実装が残っていることが判明(おそらくGitHubマージ時に履歴が分断され、
+  一部crateが失われた)。このブランチから該当クレート一式、および依存関係が
+  古くなっていた `aruaru-core`/`aruaru-dist`/`aruaru-graphql`/`aruaru-migrate`/
+  `aruaru-backup` も含め、9クレート全てをbackup版に統一した。
+  統合後、`cargo check --workspace` は全クレートで成功(警告のみ)、
+  `cargo test --workspace` は63件全て成功。todo!()/unimplemented!()/TODO/FIXME
+  マーカーが6件残存(次回巡回で内容確認・対応予定)と記録されていた。
+  `origin/backup-before-github-merge-20260705` ブランチは統合後は用済みだが、
+  削除は行っていない(履歴保全のため)。
+
+- **2026-07-11 巡回で完了した作業**:
+  - 前回パスが未コミットのまま残していた作業(aruaru-dist の raft writer、
+    aruaru-graphql の admin_resolvers 拡張、aruaru-migrate の
+    schema_convert、そして aruaru-query/aruaru-registry/aruaru-server/
+    aruaru-wire の4クレート新規実装、約32ファイル・5500行超)を検証。
+    `cargo check --workspace` / `cargo test --workspace --no-run` は
+    この時点で **既に成功しており、破損した状態ではなかった** ことを確認。
+  - `crates/aruaru-query/README.md`(0バイトの空ファイル)に、
+    `engine.rs`/`olap.rs`/`parser.rs` の実装内容(OLTPサブセットエンジン・
+    HTAPルーティング・DataFusion OLAP経路)を反映した実文書を作成。
+  - todo!()/unimplemented!()/TODO/FIXME を全リポジトリ grep し、6件超
+    (todo!() 2件 + TODOコメント多数)を発見。**全て実装で解消**:
+    - `aruaru-backup`: `BackupEngine` に `Arc<aruaru_query::QueryEngine>` を
+      持たせ、`snapshot_tables()`/`ingest_table()` 経由で実データにアクセス
+      できるよう配線。`run_full`/`snapshot`/`list_backups`/`restore` を
+      Parquet (arrow/parquet crate) ベースで実装(todo!()パニック2件を解消)。
+      SHA-256チェックサム検証・MANIFEST.json永続化込み。単体テスト4件追加。
+      **注記**: `snapshot()` は現状「コミットタグ付きの全データ Parquet
+      ダンプ」であり、ドキュメントが元々意図していた Prolly Tree の
+      reference counting による真の差分のみ CoW 保存(O(変更量))は
+      未実装(将来の最適化として残す・パニックはしない)。S3/SFTP宛先は
+      未接続のため明示的にエラーを返す(Localのみ実装済み)。
+    - `aruaru-migrate`: `from_csv.rs`/`from_postgres.rs` のTODOスタブを
+      実装に置き換え、`from_mysql.rs`/`from_parquet.rs` を新規追加
+      (Snowflakeエクスポートも Parquet経路を共有)。読み出しは
+      `aruaru-registry` の `PgWireAdapter`/`MySqlAdapter` を再利用、
+      書き込みは新設の `crate::target::TargetClient`
+      (tokio-postgres経由でaruaru-DBへ`CREATE TABLE IF NOT EXISTS`+`INSERT`)
+      で行う。SQL組み立ては `sql_build.rs` に切り出し、クォート処理を
+      単体テストで検証(ネットワーク接続なしで検証可能な部分は全てテスト化)。
+      `main.rs` のCLIも `run_migration()` を実際に呼び出すよう修正。
+    - `aruaru-graphql`: `admin_resolvers.rs` の `backups()` クエリ(空配列
+      固定のTODO)を実装。`AdminCtx` に `backup: Arc<BackupEngine>` を追加し、
+      `create_backup`/`restore_backup` ミューテーションも実バックエンド呼び
+      出しに変更(`aruaru-server` の `main.rs` で `<data>/backups` を宛先に
+      `BackupEngine` を構築し配線)。
+    - 上記により todo!()/unimplemented!()/TODO/FIXME は **0件** になった
+      (grep で再確認済み)。
+  - `cargo check --workspace` / `cargo test --workspace` は全て成功。
+    テスト数は 55件 → **76件**(aruaru-backup 4件・aruaru-migrate 9件を
+    新規追加、既存の破損なし)。
+  - `.gitignore` を新規作成し `target/` を除外。`Cargo.lock` は
+    `origin/backup-before-github-merge-20260705` ブランチでは追跡されて
+    いた実績(バイナリを持つワークスペースの慣行)に合わせ、今回追跡対象に
+    追加した。
+  - `README.md` のクレート構成表に `aruaru-registry`/`aruaru-backup` の
+    行が抜けていたため追加(`aruaru-migrate`の説明にMySQLも追記)。
+  - このCLAUDE.mdの技術スタック節を、open-raid-z 側で2026-07-10に確定した
+    「Tauri/Poem/Cosmo非依存・Rust+tokio/hyper+WASM」方針の文言に同期。
+    ただし本リポジトリのコード自体(poem/async-graphql-poem/Tauri管理GUI)は
+    **この方針にまだ移行していない** ため、その旨を明記した(上記の
+    「aruaru-db 固有の注記」参照)。
+
+- **2026-07-13 巡回で完了した作業(aruaru-dbコミット×open-raid-zスナップ
+  ショット連携、`open-web-server/CLAUDE.md`拡張要件(2)「次回新規開発予定」
+  の第一段実装)**:
+  - `crates/aruaru-dist/src/raft/node.rs`: `RaftNode`に
+    `on_commit: RwLock<Option<Box<dyn Fn(u64) + Send + Sync>>>`フィールドと
+    `set_commit_hook`メソッドを追加。`apply_committed`が適用済み最終
+    ログインデックス(=commit ID)でフックを1回呼ぶ(適用対象が無い呼び出し
+    では呼ばれない)。フック未登録時は何もしない(既存動作を変えない)。
+  - `crates/aruaru-dist/src/snapshot_pairing.rs`(新規): `SnapshotBackend`
+    トレイト(スナップショット操作の抽象化)、テスト・開発用の
+    `InMemorySnapshotBackend`、`commit_index -> snapshot_id`の対応関係を
+    記録・問い合わせできる`SnapshotPairingRegistry`、`RaftNode`へ配線する
+    `wire_to_node`関数を実装。スナップショット失敗はRaft適用パイプライン
+    自体を止めない設計(`tracing::warn!`のみ、課金/金融データの書き込み
+    成功をスナップショット失敗で巻き込まない)。
+  - `crates/aruaru-dist/src/raid_z_backend.rs`(新規、`open_raid_z`
+    feature有効時のみコンパイル): `open_raid_z_core::pool::Pool`
+    (RAID-Z2、`FileBackedDevice`6台)を実際に構築・保持し
+    `create_snapshot`を呼ぶ`OpenRaidZSnapshotBackend`を実装。
+    `Cargo.toml`に`open_raid_z_core`をpath依存として追加
+    (`default-features = false`——WinFsp/dxc/Windows SDK不要のCPU
+    フォールバックのみを使うため、`open_raid_z` feature無効時の
+    デフォルトビルドには一切影響しない)。
+  - **検証**: `real_raft_commit_triggers_real_raid_z_snapshot`統合テスト
+    (`raid_z_backend.rs`内)で、実Raft commit(`propose`→`try_commit_to`→
+    `apply_committed`)が実RAID-Z2プール上の実`create_snapshot`をトリガーし、
+    `SnapshotPairingRegistry`経由の問い合わせと実プールの
+    `snapshot_names()`の両方で対応関係を確認できることを実証した
+    (型チェックのみでの「完了」報告ではない)。`cargo test -p aruaru-dist`
+    (feature無し、21件)・`cargo test -p aruaru-dist --features
+    open_raid_z`(21件、`raid_z_backend`のテストを含む)・
+    `cargo check --workspace`・`cargo test --workspace`(デフォルト構成)
+    すべてgreenを確認。
+  - **正直なスコープの限界**: (a) 対応関係(`SnapshotPairingRegistry`)は
+    現状プロセスメモリ上のみで、永続化(再起動で失われる)は未実装——
+    将来`aruaru-backup`のMANIFEST.json的な永続化と統合することが想定
+    される。(b) 双方向のリカバリ(スナップショットからのRaftログ巻き戻し
+    等)は範囲外。(c) `open_raid_z_core`は別Cargoワークスペース
+    (`open-raid-z/open_runo_zfs_source/open_raid_z_core`)へのpath依存
+    であり、デフォルトのワークスペースビルド(`cargo check --workspace`
+    /`cargo test --workspace`)には含まれない——`open_raid_z` feature
+    (`cargo test -p aruaru-dist --features open_raid_z`)を明示的に
+    有効にした場合のみコンパイル・検証される。両リポジトリが同一の
+    `F:\open-runo`ドライブ配下にある前提のpath依存であり、CI環境や
+    別マシンでは`open-raid-z`リポジトリのチェックアウトが同じ相対位置に
+    無いと失敗する点に注意(将来的にはgitサブモジュール化やcrates.io
+    公開を検討する余地がある)。
+
+- **次回以降の巡回で確認・対応すべきこと**:
+  1. **Poem/Tauri 依存の剥離**: open-raid-z の2026-07-10方針転換に本リポジトリ
+     を追随させる場合、`aruaru-graphql`(poem/async-graphql-poem)・
+     `aruaru-server`(poem HTTPサーバ)・`admin/`(Tauri+TypeScript管理GUI)の
+     置き換えが必要。影響範囲が広いため専用のマイグレーションパスとして
+     計画すること(pgwireへの依存はPostgreSQLワイヤ互換のためのものであり
+     別軸— 剥離対象ではない)。
+  2. `aruaru-backup` の真のCoWスナップショット(Prolly Tree reference
+     counting による差分のみ保存)は未実装。現状は毎回全データをParquetへ
+     フルダンプする簡易実装。大規模データでの性能が問題になれば対応する。
+  3. ~~`aruaru-backup` のS3/SFTP宛先は未接続~~ **2026-07-12実装済み(S3のみ)**:
+     `crates/aruaru-backup/src/s3.rs`新設。`rusty-s3`でSigV4署名付きURLを
+     生成し`reqwest`で実PUT/GET/ListObjectsV2する設計(認証情報は
+     `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`環境変数から取得、
+     `BackupConfig`には持たせない)。`local_dest()`をS3宛先向けローカル
+     ステージングディレクトリ方式に変更し、既存のParquet書き込みロジックは
+     無変更のまま`write_snapshot`後にS3へアップロード、`restore`前に
+     S3からダウンロードする形で配線。SFTPは今回のパスでは引き続き未接続
+     (真に不可能ではなく単に見送り——次回対応)。署名付きURL生成ロジックは
+     分離クレートでの実ビルド・実行テスト7件で検証済み(実S3/MinIOサーバー
+     への到達確認はこの環境に無いため未実施)。
+  4. `origin/backup-before-github-merge-20260705` ブランチは引き続き
+     用済みだが削除しないこと(履歴保全のため)。
+
+## アプリケーションサーバー層の役割(open-runo / poem-cosmo-tauri、2026-07-16追記)
+
+「配信エンジン(vhost)」に`open-web-server`を選択肢として追加したが、
+open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーとして
+まだ機能していない間は、Tomcatのような互換レイヤーとして機能するのは
+`open-runo`または`poem-cosmo-tauri`である。
+
+これらは`open-raid-z`とVersionlessAPIによって、バージョンレス運用と
+バージョン管理・Git管理を両立しながら、ACID互換性とZFS互換性に対応した
+`aruaru-db`と、PostgreSQLとのDUAL DATABASE構成による「4層4重」の
+最新鋭の通信システムを構築し、仕様変更が容易なデータベース設計により、
+3DオンラインゲームAI課金アイテム、オンライン金融、オンライン証券、
+オンラインクレジットカード決済など、ネット上で紛失してはならない
+ミッションクリティカルな用途向けに、24時間365日ノンストップの
+サーバー対応WEBサイト開発を全面的にバックアップするフレームワーク・
+ミドルウェアとして機能することを目指す。
+---
+
+## HANDOFF: 2026-07-24 スマホ版電源モード対応(省電力/常時電源接続/通常)調査
+
+- **要望内容**: 「省電力版」を選ぶと実際に省電力になる、「常時電源接続版」は
+  CPU+GPU+NPUのハードウェアアクセラレーター対応、電源が外れたら自動判定
+  ではなく「省電力モードに切り替えますか?それとも通常モードのままにしますか?」
+  とダイアログで質問し選択に応じて切替(デフォルト推奨は省電力モード)、
+  電源再接続時も常時電源接続版に戻すか尋ねる導線、という要望を受領。
+- **調査結果(正直な現状)**: 本リポジトリ`aruaru-db`には`android/`ディレクトリ・
+  `.kt`(Kotlin)ファイルは**一件も存在しない**。Android向けのモバイル
+  クライアントアプリは未着手。本リポジトリはRust製の分散DBサーバー
+  (Multi-Raft、HTAP OlapCache等)であり、そもそも「スマホ単体アプリ」としての
+  用途・位置づけが現時点で明確に定義されていない(モニタリング/管理アプリ
+  なのか、エンドユーザー向けクライアントなのか未確定)。
+  したがって今回はフルアプリ新規実装はスコープ外とし、実装は行っていない。
+- **将来Androidクライアントを作る場合の電源モード管理・設計方針(未実装/設計のみ)**:
+  1. **3モード**: 「省電力版」「常時電源接続版(ハードウェアアクセラレーター対応)」
+     「通常版」をユーザーが明示的に選択できるUI(設定画面のRadio/Segmented
+     Control)を用意する。
+  2. **省電力版の具体施策**: `PowerManager`で低電力状態を検知・尊重し、
+     `WakeLock`を取得しない、DBポーリング/Raftハートビート等の通信間隔を
+     延長(例: 通常5秒→省電力30秒以上)、`BatteryManager`で残量が閾値以下
+     なら自動でさらに間引く、HWアクセラレーター(GPU/NPU、NNAPI等)を明示的に
+     無効化してCPU低クロック経路のみ使用、バックグラウンド同期は
+     `WorkManager`の`Constraints.setRequiresBatteryNotLow()`等でOS側にも
+     委譲する。
+  3. **常時電源接続版**: `BatteryManager.isCharging`/`ACTION_POWER_CONNECTED`
+     を条件にCPU+GPU+NPU(NNAPI/GPUDelegate等)を使ったハードウェア
+     アクセラレーションを有効化。ポーリング間隔は最短、WakeLock許可。
+  4. **電源切断時の質問ダイアログ**: 常時電源接続版モード中に
+     `BroadcastReceiver`で`Intent.ACTION_POWER_DISCONNECTED`を監視し検知したら
+     即自動切替はせず、AlertDialogで
+     「電源が外れました。省電力モードに切り替えますか?それとも通常モードの
+     ままにしますか?」と問い、選択に応じて上記のモード設定を切替える。
+     デフォルトの推奨(ハイライトされるボタン)は「省電力モードに切り替える」。
+  5. **電源再接続時の質問ダイアログ**: `ACTION_POWER_CONNECTED`を監視し、
+     現在省電力版/通常版であれば「電源が接続されました。常時電源接続版
+     (ハードウェアアクセラレーター対応)に戻しますか?」と問い、Yesなら
+     常時電源接続版に切替。
+  6. この設計はAndroidコードが実在する時点で初めて着手する。現状は
+     この方針をここに記録するのみで、コード変更・ビルド・commit/pushは
+     行っていない。
+
+## HANDOFF: 2026-07-24(続き) Android版モニタリング/管理クライアントを新規実装・ビルド成功
+
+- **前回HANDOFF(直上)の「未着手・設計のみ」を実装まで進めた**。
+  参照実装`open-web-server/android/`(`MainActivity.kt`の3電源プロファイル
+  +BroadcastReceiverによる電源抜き差し検知ダイアログ+プロファイル別
+  ポーリング間隔+WakeLockパターン)を読み、同じGradle構成パターンで
+  `aruaru-db/android/`を新規作成した。
+- **位置づけの確定**: aruaru-db本体(Rust製分散DBサーバー)をAndroid上で
+  動かすのではなく、既存の管理API(`crates/aruaru-server/src/admin.rs`の
+  `GET /admin/cluster`、`main.rs`で`/admin`配下にnest済み)へリモート接続
+  する**モニタリング/管理クライアント**として設計した。ネイティブ
+  バイナリ同梱・NDKクロスビルド・jniLibsは一切不要(open-web-server版との
+  最大の設計差)。
+- **実装内容**:
+  1. パッケージ名`tokyo.runo.aruarudb`(open-web-server版の
+     `tokyo.runo.openwebserver`と区別)。
+  2. `MainActivity`: `EditText`でaruaru-db管理APIのベースURLを入力・
+     `SharedPreferences`永続化、「接続/ステータス確認」ボタンで
+     `GET <url>/admin/cluster`を実際に叩き、レスポンスJSON
+     (`stats.total_nodes`/`healthy_nodes`/`total_ranges`/`table_count`/
+     `under_replicated`)をパースして画面に表示する。
+  3. 電源プロファイル管理: `PowerProfile.kt`(3モード、open-web-server版と
+     同一enum構成)、`ProfileSelectActivity`(LAUNCHER、3プロファイル専用
+     ホーム画面アイコンも`activity-alias`×3で用意)。プロファイルごとの
+     実際の差は「監視ポーリング間隔」(省電力5分/通常1分/常時電源接続5秒、
+     `pollIntervalMs()`)と「WakeLock有無」(常時電源接続のみ
+     `PARTIAL_WAKE_LOCK`取得)——open-web-server版の`healthPollIntervalMs`/
+     `applyProfilePowerBehavior`と同じ設計。
+  4. 電源抜き差し監視ダイアログ: `BroadcastReceiver`で
+     `ACTION_POWER_DISCONNECTED`/`ACTION_POWER_CONNECTED`を動的登録し、
+     常時電源接続中に電源が外れたら「省電力モードに切り替えますか?
+     それとも通常モードのままにしますか?」(既定推奨=省電力、
+     `setCancelable(false)`)、省電力/通常中に電源が接続されたら常時
+     電源接続へ戻すか尋ねる——open-web-server版と全く同じ導線をコピー。
+  5. タブレット対応: `layout-sw600dp/activity_main.xml`(幅720dp上限+
+     中央寄せ)を追加(open-web-server版と同じパターン)。
+- **ビルド確認**: このマシンには`gradlew`本体が無いが、
+  `~/.gradle/wrapper/dists/gradle-8.11.1-all/`にキャッシュ済み配布物が
+  あることを確認し(open-web-server版のセッション記録と同じ発見)、
+  `gradle-8.11.1/bin/gradle :app:assembleDebug`を直接実行したところ
+  **`BUILD SUCCESSFUL`**(33 actionable tasks executed)。
+  `android/app/build/outputs/apk/debug/app-debug.apk`(約3.24MB)が
+  実際に生成されたことを確認済み。
+- **正直な開示・未検証事項**: (1) 実機/エミュレータでの起動・
+  `GET /admin/cluster`への実際の疎通確認は今回未実施(ビルド成功までに
+  留まる、ユーザー指示通り正直に記録)。(2) `admin.rs`の他のエンドポイント
+  (`/backup`・`/migrate/*`・`/federation/*`等)への対応は今回のスコープ外
+  (最小限のモニタリングUIに集中する制約に従った)。(3) 管理API自体に
+  認証機構が現状無い(`aruaru-server`側、`grep`で`x-admin-token`相当の
+  認証コードが見当たらず)——将来追加された場合はこのアプリ側にも
+  トークン入力欄の追加が必要になる。(4) `usesCleartextTraffic="true"`は
+  開発用途のHTTP接続を許容するための設定(本番でHTTPS管理APIを使う場合は
+  見直しが必要)。
+- **次にすべきこと**: (1) 実機/エミュレータでの起動・実疎通確認、
+  (2) `admin.rs`側の管理系エンドポイント(バックアップ実行等)への
+  対応要否の検討、(3) 管理API認証機構の追加とアプリ側对応。
+
+## HANDOFF: 2026-07-25 スタンドアロン・メール ディザスタバックアップを実装
+
+**SETワイド要件(ユーザー原文の要約)**: VPS間分散同期を一切設定していなくても、
+物理断線(SATA/USB/LAN/WiFiケーブル切断)・ネットワーク障害に備え、
+メールアドレスひとつだけで有効化できる、独立した最後の砦のバックアップ
+安全網を用意すること。`open-raid-z`(`offsite_backup.rs`の`EmailBackupTarget`、
+111テスト済み)・`open-web-server`(`disaster_email_backup.rs`、153テスト済み)・
+`open-easy-web`(`dist_sync.rs`の`/admin/dist-sync/disaster-fallback`)で
+同一セッション内に完成済み。本リポジトリが4リポジトリ目。
+
+- **実装内容**:
+  1. `crates/aruaru-dist/Cargo.toml`に新feature`disaster_email_backup`を追加
+     (`dep:open_raid_z_core` + `open_raid_z_core/offsite_backup`を有効化)。
+     既存の`open_raid_z`feature(commit×ZFSスナップショット連携、
+     `snapshot_pairing.rs`)とは別軸——**こちらはZFSスナップショット連携も
+     Raftクラスタの複数ノード構成も一切不要**、単体で動く。
+  2. `crates/aruaru-dist/src/disaster_email_backup.rs`(新規)。
+     `open_raid_z_core::offsite_backup::EmailBackupTarget`をそのまま
+     path依存で再利用(メール送信ロジックは再実装しない)。
+     `DisasterEmailBackupConfig`は`EmailBackupTargetConfig`を`#[serde(flatten)]`
+     で包むだけ(必須項目はメールアドレス等、`open_raid_z_core`側定義のまま)。
+     `backup_failed_command`が`raft::Command`(Exec/Commit)をJSON化して
+     メール添付として退避する。
+  3. **失敗検知フックの設計**: 本来の理想は`RaftWriter::propose_and_wait`
+     (`crates/aruaru-dist/src/raft/writer.rs`、過半数コミット待ち
+     `wait_for_commit`が失敗・タイムアウトした経路)に自動フックすることだが、
+     `RaftWriter`は`Applier`にジェネリックで`DisasterEmailBackup`を
+     フィールドとして持たせる設計変更が必要になり、今回のパスでは
+     **`DisasterEmailBackup`単体の構築・SMTP疎通確認・メール送信までを
+     実装・テスト完了**、`RaftWriter`への自動配線(propose_and_wait失敗時に
+     自動で`backup_failed_command`を呼ぶ)は**未着手**(次回候補、下記参照)。
+     現状は呼び出し側(`aruaru-wire`等の書き込み経路)が`RaftWriter`から
+     `Err`を受け取った際に、明示的に`DisasterEmailBackup::backup_failed_command`
+     を呼ぶ運用を想定した「部品」としては完成している。
+  4. `crates/aruaru-server/src/admin.rs`に管理API追加(`disaster_email_backup`
+     feature有効時のみ):`POST /admin/disaster-email-backup`(設定)・
+     `POST /admin/disaster-email-backup/verify`(SMTP疎通確認のみ、実送信なし)。
+     `open-web-server`/`open-easy-web`と同じ規約——`x-admin-token`ヘッダー、
+     環境変数`ARUARU_DB_ADMIN_TOKEN`が未設定なら503、トークン不一致・未提示
+     なら401。**このリポジトリの`/admin/*`は元々認証機構自体が存在しなかった
+     (2026-07-24 HANDOFFで既知のギャップと記載済み)**——今回は新設の
+     ディザスタバックアップAPI限定で導入し、既存の他の`/admin/*`
+     エンドポイントへの遡及適用はスコープ外(次回候補)。
+  5. `crates/aruaru-server/Cargo.toml`に同名featureを追加し
+     `aruaru-dist/disaster_email_backup`へ素通し。
+
+- **テスト(ローカルモックのみ、正直な開示)**: `crates/aruaru-dist/src/
+  disaster_email_backup.rs`内の`#[cfg(test)]`に、`open-raid-z`の
+  `tests/offsite_backup_integration.rs`と同じ最小限の偽SMTPサーバー
+  (生TCP、EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUIT)を実装し、3テスト
+  追加(メール送信成功・クラスタ/スナップショット設定なしでの単体動作・
+  秘密情報未設定時の正直なエラー)。**実SMTPサーバー・実メールアカウントへ
+  の接続はテストで一切行っていない**。実際の物理断線(SATA/USB/LAN/WiFi
+  ケーブル抜去)シナリオも、このサンドボックス環境では検証不可能——
+  モックベースの検証のみ(`open-raid-z`自身のHANDOFFエントリと同じ
+  正直さの基準)。
+
+- **実行したコマンドと実際の結果**:
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished` dev profile(初回はopen_raid_z_core経由でlettre/russh/ureq等の
+    新規依存をコンパイル、以後は差分ビルド)。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 32 passed; 0 failed; 1 ignored`(新規3テスト
+    `disaster_email_backup::tests::*`含む、既存29テストも全てgreenのまま
+    リグレッション無し)。
+  - `cargo build --workspace` → `Finished` dev profile(デフォルトfeature構成、
+    警告2件のみ: `disaster_email_backup`feature無効時の`Request`未使用
+    importと、既存の`propose_commit`未使用関数——いずれも今回の変更が
+    原因ではない/feature無効時のみ発生する無害な警告)。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed`(`aruaru-server`はバイナリクレートで
+    元々ユニットテストを持たない構成——新設のadmin.rsハンドラ自体の
+    ロジックは薄い橋渡しのみで、実質的な検証は`aruaru-dist`側の
+    `DisasterEmailBackup`テストでカバー済み)。
+
+- **次にすべきこと(次回候補)**: (a) `RaftWriter::propose_and_wait`失敗時に
+  `DisasterEmailBackup`を自動で呼ぶ配線(`Applier`実装や`aruaru-wire`側の
+  呼び出し元での明示的なハンドリングとして実装するか、`RaftWriter`に
+  `Option<Arc<DisasterEmailBackup>>`フィールドを追加するかの設計判断が
+  必要)、(b) 既存の他の`/admin/*`エンドポイント全体への`x-admin-token`
+  認証の遡及適用、(c) Tauri Admin GUI側の対応(設定フォーム追加)。
+
+## HANDOFF: 2026-07-25(続き) `RaftWriter::propose_and_wait`のquorum障害を`DisasterEmailBackup`へ自動配線
+
+**位置づけ**: 直上のHANDOFF(同日)が「未着手」と正直に記載していたギャップ
+(`RaftWriter`への自動配線)を今回のパスで実施した。
+
+- **読んだ実コード**: `crates/aruaru-dist/src/raft/writer.rs`
+  (`RaftWriter<A: Applier + 'static>`、`propose_and_wait`)、
+  `crates/aruaru-dist/src/raft/node.rs`の`RaftNode::wait_for_commit`
+  (341〜358行目)。`wait_for_commit`が`Err`を返すのは
+  タイムアウトまでに過半数コミットへ到達できなかった場合のみ
+  (`"timeout waiting for raft commit of index {index} (quorum not
+  reached)"`という固定文言の1経路のみ)——**これが真の「quorum障害」**。
+  一方`Ok(resp)`で`resp.ok == false`のケースは、Raftとしては
+  (過半数)コミット+適用まで到達しているが`Applier`実装がコマンドを
+  拒否した場合(無効なコマンド等)であり、quorum障害ではない。両者を
+  明確に区別し、**`Err`分岐のみ**をディザスタバックアップのトリガーとした
+  (`resp.ok == false`では発火しない)。
+
+- **設計・実装内容**(`crates/aruaru-dist/src/raft/writer.rs`を変更):
+  1. `RaftWriter<A>`に`#[cfg(feature = "disaster_email_backup")]`
+     ゲート付きの`disaster_backup: Option<Arc<DisasterEmailBackup>>`
+     フィールドを追加。`RaftWriter::new`は常に`None`で初期化——
+     `feature`無効ビルドではこのフィールド自体が存在せず、コンパイル
+     結果は今回の変更前と完全に同一になる(`cfg`でフィールド自体を
+     消しているため、実行時分岐のオーバーヘッドすら残らない)。
+  2. `with_disaster_email_backup(Arc<DisasterEmailBackup>)`ビルダーを
+     追加(feature有効時のみ)。既存呼び出し元はこれを呼ばなければ
+     従来通り`None`のまま——挙動が一切変わらないことをテストで実証
+     (下記)。
+  3. `propose_and_wait`の`wait_for_commit`結果を`match`に変更し、
+     `Err(reason)`分岐でのみ`trigger_disaster_backup_if_configured`を
+     呼ぶ(`resp.ok == false`分岐は素通し、従来の`Err(resp.message)`
+     のまま)。
+  4. **非ブロッキングの実現方法**: `open_raid_z_core::offsite_backup::
+     EmailBackupTarget::upload_segment`(`disaster_email_backup.rs`が
+     再利用しているメール送信本体)を実際に読んだところ**完全に同期・
+     ブロッキングI/O**(async fnではない)と判明した。そのため
+     `trigger_disaster_backup_if_configured`は、(a)まず`tokio::spawn`で
+     呼び出し元(`propose_and_wait`)の`await`から切り離し、(b)その中で
+     さらに`tokio::task::spawn_blocking`に包んでブロッキングSMTP I/Oを
+     tokioのブロッキングスレッドプールへ退避する、という二重の構成に
+     した。`propose_and_wait`はこの`tokio::spawn`の完了を一切`await`
+     せず即座に元の`Err(reason)`を返す。
+  5. `disaster_email_backup`feature無効時は`trigger_disaster_backup_
+     if_configured`が空実装(`#[cfg(not(...))]`)になり、呼び出し自体は
+     残るが何もしない——このゲーティングにより無効ビルドへの影響は
+     皆無。
+
+- **既存テストの構造改修**: `RaftWriter`のテストが`RaftWriter { node,
+  timeout: ... }`という構造体リテラルを直接組み立てていたが、新設の
+  `disaster_backup`フィールドがfeature構成によって存在有無が変わるため
+  そのままでは両構成でコンパイルできなくなる。`with_timeout(Duration)`
+  ビルダーを新設し、既存3テストをこれ経由に書き換えた(挙動は無変更、
+  構築方法のみ変更)。
+
+- **新規テスト**(`crates/aruaru-dist/src/raft/writer.rs`):
+  1. `test_quorum_failure_without_disaster_backup_configured_behaves_
+     as_before`(feature有無どちらでもコンパイル・実行される):
+     `disaster_email_backup`feature有効ビルドでも`with_disaster_email_
+     backup`を呼ばず未設定のままなら、既存の
+     `test_write_times_out_if_quorum_never_reached`と同じquorum障害
+     シナリオで(a)結果が`Err`のまま(b)所要時間が1秒未満(余計な遅延が
+     無い)ことを実証——「未設定なら無変更」を実測で確認。
+  2. `mod disaster_backup_wiring_tests`(`#[cfg(all(test, feature =
+     "disaster_email_backup"))]`で新規モジュール化)。既存の
+     quorum失敗シミュレーション(peersは持つがネットワーク層が無いため
+     複製ACKが来ない、`test_write_times_out_if_quorum_never_reached`と
+     同じ手法を再利用——新しい障害シミュレーション機構は発明していない)
+     と、`disaster_email_backup.rs`のテストと同じ偽SMTPサーバー
+     (生TCP、EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUIT)パターンを
+     再利用。
+     - `quorum_failure_with_disaster_backup_configured_emails_the_
+       failed_command`: `DisasterEmailBackup`を設定した状態でquorum
+       障害を起こし、失敗した`Command`が実際に(モックSMTP経由で)
+       メールされることを実証(受信ボディに`"INSERT INTO items"`が
+       含まれることを確認)。
+     - `quorum_failure_does_not_block_on_disaster_backup_even_if_smtp_
+       is_unreachable`: SMTPサーバーを一切起動せず(port 1、到達不能)
+       ディザスタバックアップを設定した状態でquorum障害を起こし、
+       それでも`write_sql`自体が設定タイムアウト通り(1秒未満)で`Err`を
+       返すことを実証——非ブロッキング配線の直接的な証拠。
+
+- **実行したコマンドと実際の結果(すべて実行、以下は生ログの要約ではなく
+  実際の出力)**:
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished` dev profile(1m 03s)。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 35 passed; 0 failed; 1 ignored`(前回32件+今回
+    新規3件、既存全件green・リグレッション無し)。
+  - `cargo test -p aruaru-dist`(featureなし) →
+    `test result: ok. 30 passed; 0 failed; 1 ignored`(前回29件+
+    feature無しでもコンパイル・実行される新規1件、リグレッション無し)。
+  - `cargo build --workspace` → `Finished` dev profile(2m 40s)、
+    警告2件のみ(`aruaru-server`の`Request`未使用importと
+    `propose_commit`未使用関数)——いずれも前回HANDOFFから存在する
+    既知の無害な警告で、今回の変更が原因のものは無い。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed`(前回同様、バイナリクレートで
+    ユニットテスト無し、警告も前回同一の2件のみ)。
+
+- **正直な開示・スコープの限界**:
+  1. **非ブロッキングの検証範囲**: `quorum_failure_does_not_block_on_
+     disaster_backup_even_if_smtp_is_unreachable`はTCP接続自体が
+     即座に失敗する「到達不能ポート」シナリオで非ブロッキングを実証
+     したが、**「TCP接続は確立するがSMTPサーバーが応答をダラダラ遅延
+     させる」という真のスロー・スロー・ロリスシナリオでの検証は
+     行っていない**——このサンドボックス環境で意図的に遅いモック
+     SMTPサーバー(応答を数秒〜数十秒遅延させる)を書くことは技術的に
+     可能だが、今回はスコープを到達不能ケースの実証に留めた。
+     ただし設計自体(`tokio::spawn`+`spawn_blocking`で呼び出し元の
+     `await`から完全に切り離し)は、遅延の原因がDNS解決・TCP接続
+     確立・SMTP応答のどの段階であっても呼び出し元をブロックしない
+     はずである(`spawn_blocking`されたブロッキングタスク自体は
+     長時間かかり得るが、それは呼び出し元が待っている`Err(reason)`の
+     返却には一切影響しない)。次回、意図的に遅いモックSMTPサーバーで
+     この設計上の保証を実測することが望ましい。
+  2. **`Applier`実装側からの明示的な呼び出しは引き続き未対応**:
+     今回配線したのは`RaftWriter::propose_and_wait`(ジェネリックな
+     `RaftWriter<A>`レベル)のみ。`aruaru-wire`等の上位呼び出し元が
+     `RaftWriter`を経由せず`RaftNode`を直接使っている経路があれば
+     (現状は`aruaru-server/src/cluster.rs`が`RaftWriter`経由と
+     未使用の`propose_commit`の両方を持つ、既知の状態)、そちらは
+     今回の配線の対象外。
+  3. **`aruaru-wire`/`aruaru-server`側での実際の`with_disaster_email_
+     backup`呼び出し配線は未実施**: `RaftWriter`は今回自動配線を
+     受け付けられるようになったが、実際に`aruaru-server`起動時に
+     `DisasterEmailBackupConfig`から`DisasterEmailBackup`を構築し
+     `RaftWriter::with_disaster_email_backup`へ渡す配線(管理API
+     `POST /admin/disaster-email-backup`で設定した内容を実際の
+     `RaftWriter`インスタンスへ反映する経路)はまだ無い——現状の
+     `admin.rs`のハンドラは`DisasterEmailBackup`単体の設定検証のみで、
+     稼働中の`RaftWriter`への注入は次回対応。
+
+- **次にすべきこと(次回候補)**: (a) 意図的に遅延するモックSMTPサーバーで
+  真のスロー・スロー・ロリスシナリオでの非ブロッキング性を実測、
+  (b) `aruaru-server`起動時、`POST /admin/disaster-email-backup`で
+  設定された`DisasterEmailBackup`を稼働中の`RaftWriter`インスタンスへ
+  実際に注入する配線、(c) `aruaru-wire`が`RaftWriter`を経由せず
+  `RaftNode`を直接叩く経路が無いか棚卸し。
+
+## HANDOFF: 2026-07-25(続き2) 前回の3つの正直な未検証ギャップを埋める
+
+**位置づけ**: 直上2件のHANDOFF(同日)が挙げた3つの「正直な開示」ギャップ
+(a) 真のスロー・スロー・ロリスSMTP未検証、(b) 管理APIが稼働中の
+`RaftWriter`へ注入しない、(c) `RaftNode`直叩きの迂回経路の棚卸し未実施、
+を今回のパスで解消/前進させた。
+
+- **(a) 真の低速SMTPテストを追加(解消)**:
+  `crates/aruaru-dist/src/raft/writer.rs`の`disaster_backup_wiring_tests`に
+  `spawn_slow_fake_smtp_server`/`handle_slow_smtp_client`を追加(既存の
+  偽SMTPサーバーと同じEHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUITだが、
+  EHLO・AUTH応答をそれぞれ`std::thread::sleep(3秒)`で遅延させる——TCP接続
+  自体はすぐ確立するが、SMTP応答がダラダラ遅い真のスロー・スロー・ロリス
+  シナリオ)。新規テスト
+  `quorum_failure_does_not_block_on_disaster_backup_even_when_smtp_is_genuinely_slow`
+  は、`with_timeout(100ms)`のquorum障害シナリオで`write_sql`自体が1秒未満
+  (=3秒の遅延より遥かに短い)で`Err`を返すことを実測し、その後
+  バックグラウンドで実際にメールが届くことも確認する。これにより
+  `tokio::spawn`+`spawn_blocking`の二重デタッチが、到達不能ケースだけで
+  なく実際の低速応答でも呼び出し元をブロックしないことを実証した。
+
+- **(b) 管理APIから稼働中のRaftWriterへの実注入(解消)**:
+  1. `crates/aruaru-dist/src/raft/writer.rs`: `RaftWriter<A>`の
+     `disaster_backup`フィールドを`Option<Arc<..>>`から
+     `parking_lot::Mutex<Option<Arc<..>>>`に変更(内部可変性)。
+     `ReplicatedWriter`トレイトに`#[cfg(feature = "disaster_email_backup")]`
+     ゲート付きの新メソッド`set_disaster_email_backup(&self, backup:
+     Arc<DisasterEmailBackup>)`を追加し、`RaftWriter`に実装。これにより
+     既に`Arc`で共有済み(生存中のサーバーが保持しているのと同じ状態)の
+     インスタンスへ、構築時ビルダー(`with_disaster_email_backup`、
+     consuming)を使わず後から注入できる。新規テスト
+     `set_disaster_email_backup_after_arc_sharing_still_wires_up_correctly`
+     で、`Arc<dyn ReplicatedWriter>`化した後の注入でも実際にメールされる
+     ことを確認済み。
+  2. `crates/aruaru-server/src/admin.rs`: `AdminState`に新フィールド
+     `replicator: Mutex<Option<Arc<dyn aruaru_dist::ReplicatedWriter>>>`を
+     追加(`attach_replicator`/`replicator`アクセサ)。
+     `set_disaster_email_backup`ハンドラ(`POST /admin/
+     disaster-email-backup`)は、設定検証・保管に加えて
+     `state.replicator()`が`Some`なら`set_disaster_email_backup`を実際に
+     呼び出す(`injected_into_live_replicator`をレスポンスに含め、
+     Raftクラスタ未構築で`replicator`が無い場合は正直にその旨を
+     message_ja/enへ記載)。
+  3. `crates/aruaru-server/src/main.rs`: Raftクラスタ構築成功時、
+     pgwireサーバへ渡すのと**同一の**`Arc<dyn ReplicatedWriter>`
+     (`raft_writer`)を`admin_state.attach_replicator(raft_writer.clone())`
+     でも取り付けるよう変更(1つのRaftWriterインスタンスを両方の経路が
+     共有する)。
+
+- **(c) `RaftNode`直叩きの迂回経路を棚卸し(1件発見・配線、1件発見・
+  ドキュメント化)**:
+  1. **発見して配線した迂回経路**: `crates/aruaru-server/src/admin.rs`の
+     `cluster_propose`ハンドラ(REST `POST /admin/cluster/propose`)が、
+     `crates/aruaru-server/src/cluster.rs`の`propose_write`(`RaftNode::
+     propose`→`try_commit_to`→`maybe_commit`→`apply_committed`を直接
+     手動で呼ぶ)経由で書き込みしており、`RaftWriter`(および
+     disaster-backup配線)を完全に迂回していた。今回、上記(b)で
+     `AdminState`に取り付けた`replicator`が`Some`の場合はそちらを
+     優先して`replicator.write_sql(&req.sql).await`を呼ぶよう変更
+     (ハンドラを`async fn`化)。`replicator`が無い(クラスタ構築失敗等の
+     異常系)場合のみ、後方互換のため`cluster::propose_write`の旧経路へ
+     フォールバックする(この場合のみ引き続きdisaster-backup配線の対象外
+     であることをレスポンスの`mode: "raft_fallback_no_replicator"`と
+     messageで明示)。
+  2. **発見したが今回は配線しなかった迂回経路(既知の未解決ギャップとして
+     明記)**: `crates/aruaru-graphql/src/admin_resolvers.rs`
+     355〜365行目の`cluster_propose` GraphQL resolver(Mutation)が、
+     `RaftNode`すら経由せず`a.engine.execute(&sql)`で`QueryEngine`へ
+     **直接**書き込んでいる(Raftコンセンサス自体を完全にスキップ)。
+     この経路は`AdminCtx`(同ファイル17〜21行目、`engine`/`registry`/
+     `backup`の3フィールドのみ)が`RaftWriter`/`replicator`への参照を
+     一切持っていないため。`aruaru-graphql`の`Cargo.toml`は現状
+     `aruaru-dist`に依存しておらず、`AdminCtx`への`replicator`追加・
+     `main.rs`側でのGraphQLコンテキスト構築箇所(`AdminCtx { engine:
+     .., registry: .., backup: .. }`)への配線・スキーマ影響確認が
+     必要になるため、今回のパスでは着手せず正直に未解決として記録する
+     (次回候補、下記)。**単一ノード構成では`QueryEngine`への直接書き込み
+     も最終的に同じ状態に収束するため実害は小さいが、複数ノードクラスタ
+     構成でこのGraphQL経路から書き込むと、Raftレプリケーションを経由せず
+     ローカルノードのみに適用される=他ノードとの一貫性が崩れる、
+     という真のバグになり得る**。
+  3. その他`RaftNode`使用箇所(`crates/aruaru-dist/src/multi_raft.rs`の
+     `MultiRaftGroups`、`crates/aruaru-dist/src/raid_z_backend.rs`・
+     `snapshot_pairing.rs`のテスト用途)は`aruaru-server`の実運用書き込み
+     経路(pgwire・REST admin API)からは呼ばれておらず、今回の迂回経路
+     棚卸しの対象外(`multi_raft`は複数Raftグループの実験的抽象化で、
+     現状`aruaru-server`からは未使用)。
+
+- **実行したコマンドと実際の結果(すべて実行、生ログ)**:
+  - `cargo build --workspace` →
+    `warning: unused import: \`Request\`` (admin.rs:18、feature無効時のみ)、
+    `warning: function \`propose_commit\` is never used` (cluster.rs:86、
+    今回のフォールバック経路が呼ばないため引き続き未使用)の2件のみ、
+    `Finished \`dev\` profile [optimized + debuginfo] target(s) in 1m 57s`。
+    いずれも前回HANDOFFから存在する既知の無害な警告で、今回の変更が
+    原因のものは無い。
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished \`dev\` profile [optimized + debuginfo] target(s) in 20.46s`。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered
+    out; finished in 6.20s`(前回35件+今回新規2件
+    `quorum_failure_does_not_block_on_disaster_backup_even_when_smtp_is_
+    genuinely_slow`・`set_disaster_email_backup_after_arc_sharing_still_
+    wires_up_correctly`、既存全件green・リグレッション無し)。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed; 0 measured; 0 filtered out;
+    finished in 0.00s`(前回同様バイナリクレートでユニットテスト無し、
+    警告は`propose_commit`未使用1件のみ)。
+  - `cargo test -p aruaru-dist`(featureなし) →
+    `test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0
+    filtered out; finished in 0.12s`(前回同数、リグレッション無し)。
+  - `cargo test -p aruaru-server`(featureなし) →
+    `test result: ok. 0 passed; 0 failed; 0 measured; 0 filtered out;
+    finished in 0.00s`(警告2件、`Request`未使用importと`propose_commit`
+    未使用関数、いずれも既知)。
+
+- **正直な開示・スコープの限界(今回も残るもの)**:
+  1. `crates/aruaru-graphql/src/admin_resolvers.rs`の`cluster_propose`
+     resolverは引き続き`RaftWriter`/`replicator`を経由しない(上記(c)-2
+     参照)。GraphQL Admin GUIから複数ノードクラスタ構成でこの
+     ミューテーションを叩くと、disaster-backup対象外なだけでなく
+     Raftレプリケーション自体をスキップする(単一ノードでは実害なし)。
+  2. (a)のテストは「EHLO/AUTH応答を3秒遅延」という具体的な低速シナリオ
+     を検証したが、DNS解決自体が遅いケースやTLSハンドシェイクが遅い
+     ケースなど、遅延が発生し得る全段階を網羅したわけではない
+     (`tokio::spawn`+`spawn_blocking`という設計そのものは段階を問わず
+     呼び出し元を保護するはずだが、個別の実測は今回の1シナリオのみ)。
+  3. Tauri Admin GUI側の対応(ディザスタバックアップ設定フォーム追加)は
+     引き続き未着手(前々回HANDOFFから継続する既知の次回候補)。
+
+- **次にすべきこと(次回候補)**: (a) `aruaru-graphql`の`AdminCtx`へ
+  `replicator: Option<Arc<dyn aruaru_dist::ReplicatedWriter>>`を追加し
+  (`aruaru-graphql`の`Cargo.toml`へ`aruaru-dist`依存を追加する必要あり)、
+  GraphQL `cluster_propose` resolverもRaftWriter経由に統一する、
+  (b) Tauri Admin GUIのディザスタバックアップ設定フォーム、
+  (c) `cluster.rs`の`propose_commit`(既に未使用)を、フォールバック経路
+  以外で使う予定が無いなら削除するか、GraphQL側統一の際に活用するか判断する。
+
+## HANDOFF: 2026-07-27 前回エントリの「次にすべきこと(4) capabilities/
+ディレクトリの要否確認」を確認・解消
+
+`admin/src-tauri`で`capabilities/`ディレクトリを追加せずに`cargo build`
+を実行し、警告・エラーいずれも出ないことを確認した(`capabilities`という
+文字列を含む出力自体が皆無)。Tauri v2のパーミッション定義
+(`capabilities/*.json`)は、既定の`main`ウィンドウに対するデフォルト
+パーミッションセットで足りている限り省略可能で、このアプリ(既存の
+`tauri::Builder::default()`+標準プラグイン`shell`/`fs`/`dialog`のみ)は
+その範囲内であるため、現状は追加不要と判断する。**正直な開示**:
+`cargo tauri dev`での実ネイティブウィンドウ起動時に、特定の操作
+(ファイルダイアログ経由の書き込み等)でパーミッション拒否が実際に
+発生するかどうかまでは検証していない(`cargo build`が通ることの確認に
+留まる)——問題が実際に顕在化した場合に`capabilities/`を追加する、という
+方針で次回以降へ持ち越す。
+- 次にすべきこと: 前回エントリの(1)(2)(3)(5)から変更なし
+  (実アイコン素材への差し替え、`cargo tauri dev`での実ネイティブ
+  ウィンドウ起動確認、実SMTPサーバーでのE2E確認、GraphQL
+  `cluster_propose` resolverのRaftWriter経由統一)。
+
+## HANDOFF: 2026-07-26 Tauri Admin GUIのディザスタバックアップ設定フォームを実装
++ アプリ自体が一度もビルドできていなかった重大な既知の欠落を発見・解消
+
+上記2026-07-25(続き2)の「次にすべきこと(次回候補)(b) Tauri Admin GUIの
+ディザスタバックアップ設定フォーム」に対応(ユーザー指示: runo.tokyo/
+open-directx/open-cuda/aruaru-llm等7リポジトリの未着手・未完成事項の
+洗い出し→実装継続、SETバックアップ系の実接続配線の一環として着手)。
+
+**正直な開示(最重要): 着手前の調査で、`admin/`(Tauri Admin GUI)は
+これまで一度も実際にビルドできる状態になっていなかったことが判明した**。
+既存のHANDOFFはRust側コマンド(`main.rs`)・Reactページ群の「コードとしての
+実装」を記録していたが、以下が全て欠落しており、`cargo build`も
+`npm run build`も過去に一度も成功していなかった(型チェック・実行の
+どちらも行われないまま「実装済み」として記録されてきたことになる):
+- `admin/src-tauri/tauri.conf.json`(Tauriアプリ設定ファイル自体が存在しない)
+- `admin/src-tauri/build.rs`
+- `admin/src-tauri/icons/`(`icon.png`/`icon.ico`)
+- `admin/index.html`・`admin/src/main.tsx`・`admin/src/index.css`
+  (Reactのブートストラップ自体が無く、`App.tsx`以下のページ群は
+  どこからも読み込まれない孤立したファイル群だった)
+- `admin/vite.config.ts`・`admin/tsconfig.json`・`admin/tsconfig.node.json`・
+  `admin/tailwind.config.js`・`admin/postcss.config.js`
+- `admin/src-tauri/Cargo.toml`: `[lib]`セクションが`aruaru_admin_lib`という
+  存在しない`src/lib.rs`を指しており、マニフェスト解析自体が失敗する状態
+  (`can't find library aruaru_admin_lib`)。加えてワークスペースルート
+  (`F:\runo\aruaru-db\Cargo.toml`)の`members`にも含まれておらず、
+  「ワークスペースに属していると誤認された状態」でも失敗する
+  (`current package believes it's in a workspace when it's not`)。
+
+1. **最小限のTauri+Viteスキャフォールドを新規作成**(具体的な処理を追加
+   実装したのではなく、`cargo tauri init`相当の土台を後追いで補った):
+   `tauri.conf.json`(`devUrl: http://localhost:1420`、`frontendDist:
+   ../dist`、`identifier: tokyo.aon.aruaru-db.admin`)、`build.rs`、
+   1x1のプレースホルダー`icon.png`/`icon.ico`(実アイコン素材は今回
+   用意していない、ビルドを通すための最小限のダミー画像であることを
+   正直に記録)、`index.html`+`src/main.tsx`+`src/index.css`
+   (Tailwindディレクティブ)、`vite.config.ts`、`tsconfig.json`/
+   `tsconfig.node.json`、`tailwind.config.js`/`postcss.config.js`、
+   `package.json`に`"type": "module"`を追加。`admin/src-tauri/Cargo.toml`
+   から壊れていた`[lib]`セクションを削除(`aruaru_admin_lib`を参照する
+   コードは他に存在しないことを`grep`で確認済み)し、空の`[workspace]`
+   テーブルを追加してワークスペースルートから独立させた(cargo自身が
+   エラーメッセージで提示した2つの選択肢のうち、`crates/`配下の
+   ライブラリを直接参照しない独立GUIアプリという性質からこちらを選択)。
+2. **ディザスタ用メール退避のTauriコマンド2件を新規実装**
+   (`admin/src-tauri/src/main.rs`): `set_disaster_email_backup`
+   (`POST /admin/disaster-email-backup`、`DisasterEmailBackupForm`
+   構造体は`open_raid_z_core::offsite_backup::EmailBackupTargetConfig`と
+   同じフィールド構成)、`verify_disaster_email_backup`
+   (`POST /admin/disaster-email-backup/verify`、SMTP疎通確認のみ)。
+   `generate_handler!`マクロへ登録。
+3. **`admin/src/pages/backup/BackupManager.tsx`に「📧 ディザスタ用メール
+   退避(最後の砦)」セクションを新規追加**(既存の「バックアップ管理」
+   ページ内、新規ルーティングは追加せず既存ナビゲーションに相乗り):
+   SMTPホスト/ポート/ユーザー名/パスワード環境変数名/送信元/退避先の
+   各入力欄、平文接続許可チェックボックス、「設定を保存」「SMTP接続を
+   確認」ボタン、結果メッセージ表示。SMTPパスワードそのものはフォームに
+   入力させない設計(環境変数名のみ、既存の`open_raid_z_core`側の方針を
+   踏襲)。**発見した既存バグの修正**: 同ファイル124行目の`phaseColor`
+   関数が、`Phase`型の一部のケース(`Preparing`/`DumpingSchema`等)しか
+   持たないオブジェクトリテラルを`Record`的に扱っておりTypeScriptの
+   型エラーになっていた(`tsc`を初めて実際に実行して発覚)。
+   `Partial<Record<Phase, string>>`へキャストして解消(既存のフォール
+   バック`?? "text-orange-400"`の意図はそのまま)。
+4. **検証(実測、型チェック・ビルド成功だけで終わらせない方針の徹底)**:
+   - `npm install`→`npm run build`(`tsc && vite build`)が**初めて**
+     成功(`dist/`が実際に生成されることを確認)。
+   - `cargo build`(`admin/src-tauri`)が**初めて**成功。
+   - `npm run dev`で実際にVite開発サーバーを起動し(`http://localhost:1420`)、
+     実ブラウザ(Claude Code内蔵のBrowserツール)で実際にページを開いて
+     スクリーンショット・`get_page_text`で確認: (a) サイドバー・
+     ダッシュボードが実際にレンダリングされること、(b)「バックアップ」
+     ページへ実際に遷移でき、新設した「📧 ディザスタ用メール退避」
+     セクションの全フィールド・ボタン・注意書きの文言が実際にDOM上に
+     存在すること、(c)「SMTP接続を確認」ボタンを実際にクリックし、
+     Tauri IPCブリッジが無いブラウザ単体環境では`invoke`が失敗する
+     ことを利用して、エラー時のcatchハンドリングが実際に動作し
+     (「SMTP接続確認に失敗しました: TypeError: Cannot read properties
+     of undefined (reading 'invoke')」という具体的なエラーメッセージが
+     画面に表示される)、画面がクラッシュしないことを確認した。
+   - 上記(c)は「実Tauriデスクトップアプリ(WebView2)としての起動」では
+     ない(ブラウザ単体でのVite devサーバー確認)ため、実際の
+     `cargo tauri dev`でのネイティブウィンドウ起動・実SMTPサーバーへの
+     `set_disaster_email_backup`/`verify_disaster_email_backup`の
+     実際の疎通は今回未検証。
+5. **正直な開示(引き続き残る制約)**: (1) `icon.png`/`icon.ico`は
+   1x1のダミー画像であり、実際のアプリアイコン素材ではない(配布用
+   ビルド`tauri build`を行う前に差し替えが必要)。(2) `capabilities/`
+   ディレクトリ(Tauri v2のパーミッション定義)は今回作成しておらず、
+   ビルド時の警告等が出ていないか次回`cargo tauri dev`実行時に確認が
+   必要。(3) 実Tauriネイティブウィンドウでの動作確認・実SMTPサーバーへの
+   接続確認は未実施(上記4参照)。(4) GraphQL側の`disaster_email_backup`
+   専用resolverは引き続き存在しない(HTTP `/admin/*`経由のみ、
+   2026-07-25(続き2)の開示のまま変更なし)。
+- 次にすべきこと: (1) 実アイコン素材への差し替え、(2) `cargo tauri dev`
+  での実ネイティブウィンドウ起動確認、(3) 実SMTPサーバーでの
+  `set_disaster_email_backup`→`verify_disaster_email_backup`のE2E確認、
+  (4) `capabilities/`ディレクトリの要否確認、(5) GraphQL
+  `cluster_propose` resolverのRaftWriter経由統一(2026-07-25(続き2)から
+  継続する既知の次回候補)。
+
+## HANDOFF: 2026-07-27(続き) `AS OF COMMIT`のフルテーブルスキャン(WHERE無し)対応
+
+`open-raid-z/CLAUDE.md`が「VersionLessAPIハイブリッドバージョン管理の
+読み出し側=commit_id指定クエリは未着手」と記録していたが、調査の結果
+**単一行(PK一致の`WHERE`)経路は既に実装済み**で、未着手だったのは
+`WHERE`無し・複数行のフルテーブルスキャンのみだったと判明したため、
+そのギャップだけを埋めた(過大な既存実装の見落としを防ぐため、
+着手前に実装済み範囲を正直に確認してから作業した)。
+
+1. **`crates/aruaru-query/src/engine.rs::select_as_of`を拡張**:
+   `filter: None`(`WHERE`無し)の場合、`ProllyTree::scan()`で該当commitの
+   全ノードを取得し、`table\0`プレフィックス(`snapshot_root()`が書き込む
+   キー形式と同一)で対象テーブルの行だけに絞り込む。単一行経路
+   (`tree.get(&key)`によるポイントルックアップ)はそのまま維持し、
+   フルスキャンの計算コストを不要な場合に払わないようにした。
+2. **`parser.rs`は変更不要だった**: `AS OF COMMIT`の構文解析は既に
+   通常の`SELECT`を再パースして`table`/`filter`をそのまま流用する実装
+   だったため、`WHERE`無しの`SELECT * FROM t AS OF COMMIT '...'`は
+   追加実装なしで`filter: None`として正しくパースされていた。
+3. **検証**: 新規テスト`as_of_commit_without_where_returns_all_rows_as_of_that_commit`
+   を追加(2行commit後に3行目を追加し、`AS OF COMMIT`が3行目を含まず
+   commit時点の2行のみを返すこと、最新状態には3行とも存在することを
+   確認)。`cargo test -p aruaru-query`**43件全green**(既存
+   `as_of_commit_returns_the_value_from_that_commit_not_the_latest`含め
+   回帰なし)。
+4. **正直な未対応事項**: GraphQL/REST admin API側への配線は今回未実施
+   (現状は生SQL経由のみ)。列名の順序保証(`rows.sort()`で行の内容全体を
+   ソートしているため、複数列で最初の列の値が同じ場合はテーブル本来の
+   挿入順と一致しない可能性がある——determinism優先の簡易実装であり、
+   本来のINSERT順保持が必要になった場合は別途対応が要る)。
+- 次にすべきこと: (1) GraphQL/admin resolversから`AS OF COMMIT`
+  フルスキャンを呼び出せるようにする配線、(2) 行順序をINSERT順で
+  保持したい場合のソートキー見直し。
+
+## HANDOFF: 2026-07-30(続き) Web管理UI(RPoem)新規実装 + `/admin/*`認証の遡及適用(セキュリティ強化)
+
+ユーザー指示「Rust + RPoem(tokio/hyper直接実装)」でopen-raid-zと対の
+Web管理UIを構築。その過程でユーザーから複数回「aruaru-serverは外部から
+乗っ取られないようにセキュリティをしっかりして」との指示があり、実際に
+重大なギャップを発見・修正した。
+
+1. **重大な発見**: `crates/aruaru-server/src/admin.rs`の`/admin/*`は
+   `disaster-email-backup`系エンドポイント限定でのみ`x-admin-token`
+   認証を持ち、`cluster`/`backup`/`migrate`/`federation`/`registry`/
+   `raft/append`/`raft/vote`を含む**大半のエンドポイントには認証が
+   一切無かった**(`aruaru-db/CLAUDE.md`2026-07-24 HANDOFFで既知の
+   ギャップとして記録済みだったが未対応のままだった)。さらに
+   `main.rs`を確認したところHTTPサーバ(GraphQL/admin両方を配信)は
+   `0.0.0.0:{gql_port}`にbindするデフォルト設定であり、ファイア
+   ウォール等の追加防御が無い場合はクラスタ状態の閲覧だけでなく
+   バックアップ実行・移行実行・Raftノード操作まで**インターネットから
+   無認証で到達可能**という実際の露出だった。
+2. **修正**: `admin_routes()`が返す`Route`全体を`.around()`
+   ミドルウェアで包み、`check_admin_auth`(`x-admin-token`ヘッダー+
+   `ARUARU_DB_ADMIN_TOKEN`環境変数)を`/admin/*`配下の**全**
+   エンドポイントへ遡及適用した(2026-07-25(続き2)エントリの
+   「次回候補(b)」として明記されていた項目)。環境変数未設定なら503、
+   ヘッダー不一致なら401——`raft/append`/`raft/vote`も同じゲート配下
+   に入った(現状これらを実際に呼ぶノード間通信はまだ配線されていない
+   ため実害は無いが、将来配線される際は各ノードに同じ
+   `ARUARU_DB_ADMIN_TOKEN`を設定する必要がある点をコメントに明記)。
+3. **タイミングサイドチャネル対策**: 素の`!=`比較はCWE-208
+   (タイミング攻撃)のリスクがあるため、`constant_time_eq`
+   (全バイトを走査してからXOR累積判定、長さの違いも早期リターン
+   しない)を新設し、トークン比較をこれに置き換えた。新規crate依存
+   (`subtle`等)は追加せず、この用途限定の最小実装とした。
+4. **Web管理UI(`aruaru-db/web/`、新規独立クレート)**: RPoem
+   (`open-runo-poem-compat`)へのpath依存のみ。既存の`aruaru-server`
+   (常駐デーモン)の`/admin/cluster`(GET)・`/admin/cluster/rebalance`
+   (POST)をリバースプロキシする。**2段階の独立したトークン**:
+   ブラウザ↔本Web層(`ARUARU_WEB_ADMIN_TOKEN`)、本Web層↔aruaru-server
+   (`ARUARU_UPSTREAM_ADMIN_TOKEN`、aruaru-server起動時の
+   `ARUARU_DB_ADMIN_TOKEN`と同じ値)。`ARUARU_WEB_READ_ONLY=1`設定時は
+   正しいトークンでも常に403(rs-sync/open-raid-z/webと同じ多層防御
+   設計)。
+5. **実機検証(型チェックのみで完了と報告しない方針を徹底)**: 実際に
+   `aruaru-server`をローカルで起動し、(a) `ARUARU_DB_ADMIN_TOKEN`未設定
+   時は`/admin/cluster`が503(修正前は無条件200で実データが漏れて
+   いた)、(b) トークン設定後、誤ったトークンは401・正しいトークンは
+   200で実クラスタ状態を返す、(c) 同じ試験を`raft/append`にも実施し
+   401を確認、(d) 同じ長さ/異なる長さの誤トークンいずれも問題なく401、
+   (e) Web UI経由でも2段階トークンを通して実際にステータス取得・
+   リバランス実行が成功する、(f) `ARUARU_WEB_READ_ONLY=1`時は正しい
+   トークンでも403、をすべて実際のHTTPリクエストで確認した。
+   `cargo build --workspace`・`cargo test -p aruaru-server --features
+   disaster_email_backup`ともリグレッション無し(既存の
+   `propose_commit`未使用警告のみ、無関係)。
+6. **正直な開示・未着手**: (a) VPSへの実デプロイ・TLS終端の実運用
+   設定(`--tls-cert`/`--tls-key`フラグ自体はmain.rsに既存)は今回
+   未実施、(b) `aruaru-graphql`側の`cluster_propose` GraphQL resolver
+   (2026-07-25(続き2)で発見済みの別の迂回経路、`RaftWriter`を経由せず
+   `QueryEngine`へ直接書き込む)は今回も未対応のまま(GraphQL自体には
+   今回の`x-admin-token`ゲートを適用していない、別軸の認証方針のため
+   スコープ外とした)、(c) `/graphql`エンドポイント自体にもレート
+   制限・認証は無い(今回のスコープはREST `/admin/*`限定)。
+- 次にすべきこと: (1) VPS実デプロイ+TLS設定、(2) `aruaru-graphql`の
+  `cluster_propose` resolverをRaftWriter経由に統一(既知の残課題、
+  変更なし)、(3) `/graphql`エンドポイント自体の認証・レート制限。
+
+## HANDOFF: 2026-07-30 安全なアンインストーラー(uninstall.sh/uninstall.ps1)を新設
+
+ユーザー指示「別バージョンをインストールし直す/アンインストールする際に
+既存データやHDDのデータへ悪影響を与えないように」への対応。従来
+`install.sh`/`install.ps1`のみでアンインストーラーが存在しなかった。
+
+1. **安全性の設計方針(最重要)**: `install.sh`/`install.ps1`が作成する
+   データディレクトリ(`/var/lib/aruaru-db`、`C:\ProgramData\aruaru-db`、
+   `ARUARU_DATA_DIR`)には実際のDBデータ(fjall/redbのストレージ
+   ファイル)が入っている。新設の[uninstall.sh](uninstall.sh)/
+   [uninstall.ps1](uninstall.ps1)は**このデータディレクトリを絶対に
+   削除しない**——サービス(systemdユニット/Windowsサービス)を停止・
+   無効化し、バイナリを削除するのみ。データディレクトリが見つかった
+   場合は場所を明示して終了し、完全削除したい場合は内容を確認した上で
+   手動でコマンドを実行するよう案内する(自動実行はしない)。
+2. `open-raid-z`(データディレクトリを持たない設計、バイナリのみ)側にも
+   同様のアンインストーラーを同時に新設した。詳細は
+   `open-raid-z/CLAUDE.md`参照。
+3. **正直な開示**: 実際にインストール→データ書き込み→アンインストール
+   →データディレクトリが残っていることの実機検証は今回未実施(スクリプト
+   のロジックレビューとシェル構文チェックのみ)。
+- 次にすべきこと: (1) 実環境(Linux実機/Windows実機)でのインストール→
+  アンインストール→データ保全の実地検証。
+
+## HANDOFF: 2026-08-01(続き) GraphQL経由の管理操作にも認証を適用(2026-07-25(続き2)/07-27エントリの「未解決」を解消)
+
+過去のHANDOFF(2026-07-25続き2・07-27・07-30)が繰り返し「次にすべきこと」
+として記録していた`aruaru-graphql`側の認証欠如を解消した。
+
+1. **調査で判明したこと**: `cluster_propose` resolverの`RaftWriter`経由化
+   自体は既に**2026-07-26に実装・テスト済み**だった(`admin_resolvers.rs`
+   のdocコメント・`cluster_propose_tests`モジュールで確認、実際に
+   `cargo test`で再確認しgreen)——CLAUDE.mdの「次にすべきこと」記載が
+   古いまま更新されていなかっただけ(このエコシステムで繰り返し見られる
+   「ドキュメントの追従漏れ」パターン)。一方、**GraphQL `/graphql`
+   エンドポイント自体に認証機構が一切無い**という別の欠如は実際に
+   未解消のまま残っていた——REST側`/admin/*`は2026-07-30に
+   `x-admin-token`認証を遡及適用済みだったが、**同じ管理操作
+   (`clusterStatus`・`createBackup`・`runMigration`・`clusterPropose`等)を
+   GraphQL経由で呼べば無認証のまま実行できてしまう抜け穴**が残っていた。
+2. **修正**: `graphql_endpoint`を`async-graphql-poem`既定の
+   `GraphQL::new(schema)`から、`x-admin-token`ヘッダーを読み取り
+   `GraphqlAdminToken`としてリクエストデータへ注入する薄いハンドラへ
+   置き換えた。`admin_resolvers.rs`に`require_admin_token`
+   (REST側`admin.rs`の`check_admin_auth`/`constant_time_eq`と同じロジック・
+   同じ環境変数`ARUARU_DB_ADMIN_TOKEN`)を新設し、既に`admin(ctx)?`を
+   呼んでいたresolverはそのヘルパー経由で自動的に保護対象になるよう
+   `admin()`自体に検証を組み込み、`admin(ctx)`を呼んでいなかった残りの
+   resolver(`preview_source`・`test_registry_connection`・
+   `set_parallel_config`・`cluster_node_op`等)にも個別に追加した。
+   `VcsQuery`/`VcsMutation`(通常のバージョン管理系クエリ)は対象外——
+   `/graphql`は1つのスキーマに管理系と非管理系を統合しているため、
+   エンドポイント全体を一律に塞ぐと通常利用まで巻き込むと判断した。
+3. **検証(実測)**: 新規テスト4件
+   (`admin_query_without_token_is_rejected`・
+   `admin_query_with_wrong_token_is_rejected`・
+   `admin_query_with_correct_token_succeeds`・
+   `non_admin_vcs_query_does_not_require_a_token`)、既存2件
+   (`cluster_propose_*`)含め`cargo test -p aruaru-graphql`**6件全green**。
+   `cargo build --workspace`成功(既存の`propose_commit`未使用警告のみ、
+   無関係)。**本番デプロイ後、実際に`curl`で`/graphql`へ`x-admin-token`
+   無し→エラー、誤ったトークン→エラー、正しいトークン→実クラスタ状態
+   (`{"data":{"clusterStatus":{"stats":{"totalNodes":1}}}}`)、非管理系
+   `log`クエリはトークン無しでも成功**、の4パターンをすべて実際の
+   HTTPリクエストで確認した(型チェックのみでの完了報告ではない)。
+4. **正直な開示**: (a) 一部のAdmin resolver(`set_backup_schedule`・
+   `cluster_node_op`・`rebalance_cluster`・フェデレーション系)は元々
+   状態を持たないスタブ実装(入力をそのまま返すのみ)だが、一貫性・
+   将来の実装差し替えに備えて認証は同様に適用した、(b) `/graphql`
+   エンドポイント全体のレート制限は引き続き未実装(認証は追加したが
+   スロットリングは別軸の課題として残る)。
+- 次にすべきこと: 特に緊急の課題は無し。`/graphql`のレート制限は
+  今後の課題として残る。
+
+## HANDOFF: 2026-08-01 Web管理UIをVPS本番へデプロイ+実バグ発見・修正(ユーザー指示「Bの横断バックログを優先順位を付けて進めて」)
+
+前回エントリの「次にすべきこと(2)」(Web管理UIのVPSデプロイ)に対応。
+`open-raid-z`で同日実施した同種のデプロイ作業の直後に着手。
+
+1. **既存VPS上のチェックアウトを使わず、クリーンクローンで対応**:
+   VPS上の`/root/open-aruaru/aruaru-db`は未コミットの大量の削除・
+   追跡外ファイル(古いv0.5.0リリースzipの展開残骸等)を抱えた不安定な
+   状態だったため、誤って上書き・破棄しないよう**触れずに**
+   `/root/aruaru-db`へ新規クリーンクローンして作業した。
+2. **単一ノードのスタンドアロン構成でデプロイ**: `aruaru-server`
+   (`--raft-id 1`、peers無し)をport 4001/5433で起動
+   (`aruaru-server.service`)、Web管理UI(`aruaru-db-web`)をport 8111
+   で起動(`aruaru-db-web.service`)。`ARUARU_DB_ADMIN_TOKEN`/
+   `ARUARU_WEB_ADMIN_TOKEN`/`ARUARU_UPSTREAM_ADMIN_TOKEN`をそれぞれ
+   生成しsystemd環境変数として設定(値は`/root/.aruaru-db-admin-token`/
+   `/root/.aruaru-db-web-admin-token`にも保存)。`open-web-server`の
+   「分身の術」テナント登録(`path_prefix=/aruaru-db`)で
+   `https://easy-web.tokyo/aruaru-db/`へ接続。
+3. **実バグ発見・修正: 絶対パスfetchが`/aruaru-db`マウント配下で
+   壊れていた**: 実際に`https://easy-web.tokyo/aruaru-db/`を実ブラウザで
+   開いたところ、クラスタ状態が`{"error":"not found"}`と表示される
+   ことを発見。`web/src/main.rs`のJSが`fetch('/api/status')`という
+   絶対パスでリクエストしており、`/aruaru-db`マウント配下では常に
+   オリジン直下(`https://easy-web.tokyo/api/status`)を叩いてしまい
+   404になっていた——**open-redmine/open-gitea/RS-Syncが過去に繰り返し
+   踏んだのと全く同じ「絶対パスfetch罠」**(`PORTING.md`に記録済みの
+   既知パターン)がこのリポジトリでも初めて実際に踏まれた形。
+   `ARUARU_WEB_BASE_PATH`環境変数(既定は空文字列、後方互換)を追加し、
+   ページのJSへ`const BASE_PATH = '{base_path}';`として埋め込み、
+   両方の`fetch()`呼び出しに前置するよう修正。
+4. **検証(実測)**: `cargo build --release`(ローカル・VPS両方)成功。
+   本番へ`ARUARU_WEB_BASE_PATH=/aruaru-db`を設定して再起動後、
+   **実際にブラウザで`https://easy-web.tokyo/aruaru-db/`を開き**、
+   ページ読み込み時に自動でクラスタ状態(`total_nodes:1`,
+   `healthy_nodes:1`等)が正しく表示されること、コンソールエラーが
+   無いことを確認した(修正前は`{"error":"not found"}`だったことを
+   実際に確認した上での修正、型チェックのみでの完了報告ではない)。
+5. **正直な開示**: (a) `/aruaru-db/demo`という別テナントは今回登録
+   していない(`GET /api/status`は元々認証不要、`open-raid-z`の
+   デプロイ時と同じ判断)、(b) 単一ノード構成のため、Multi-Raft・
+   複数ノードクラスタとしての実地検証はまだ行っていない(スタンドアロン
+   での起動・疎通確認のみ)、(c) TLS終端は`open-web-server`側の
+   リバースプロキシに委ねている(このアプリ自体のTLS設定は未使用)。
+  - 次にすべきこと: 特に緊急の課題は無し。複数ノードクラスタとしての
+    実地検証は今後の課題として残る。
+
+## エコシステム全体マップ(2026-07-21追記)
+
+同時並行開発の対象プロジェクト一覧・各リポジトリの現況は
+[`open-raid-z`のCLAUDE.md](https://github.com/aon-co-jp/open-raid-z/blob/main/CLAUDE.md)
+「関連プロジェクト」節を参照。**どのリポジトリから読み始めても、
+この節を起点に他プロジェクトへ辿れる**ようにしてある(新規追加:
+RS-Git・RS-JSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身の状況は
+このファイルの他の節・HANDOFFを参照)。
+
+## HANDOFF: 2026-08-20 自動アップデート機能(GitHub Releases検知+ヘルスチェック+自動ロールバック)を新設・実機検証
+
+前回セッションでAPI利用上限により未コミットのまま残っていた
+`self_update.rs`(`open-english`/`aruaru-llm`/`rs-sync`/`RPoem`等で
+確立済みのパターンに追従)を検証・完成させた。
+
+1. **発見した未コミット変更**: `Cargo.lock`・
+   `crates/aruaru-server/Cargo.toml`(`reqwest`依存追加)・
+   `crates/aruaru-server/src/main.rs`(`self_update`モジュール登録、
+   `/healthz`ハンドラ新設、起動時に`self_update::check_and_apply_update`
+   を`tokio::spawn`)・`crates/aruaru-server/src/self_update.rs`
+   (新規、未追跡)。実装は既に完成していた: GitHub Releases API
+   (`aon-co-jp/aruaru-db`)からの最新リリース取得・semver比較
+   (`parse_version`/`is_newer`)・プラットフォーム別アセット判定
+   (Windows `.zip`/Linux `.tar.gz`)・ダウンロード・展開
+   (`Expand-Archive`/`tar`)・新バイナリの起動+`HEALTH_CHECK_SECS`
+   (12秒)以内の`/healthz`到達確認+失敗時の旧バイナリへの自動
+   ロールバックを、Windows用`.bat`スクリプト・Unix用`.sh`スクリプト
+   それぞれで実装済みだった。**既定で無効**
+   (`ARUARU_DB_ENABLE_SELF_UPDATE=1`を明示設定しない限り何もしない)
+   ——`aruaru-server`は`--data`に実データを保持する常駐DBサーバーで
+   あるため、意図せぬ自己更新による不意の再起動を避ける、より慎重な
+   既定off設計。単体テスト3件(`parses_version_strings_with_and_
+   without_v_prefix`・`is_newer_compares_semver_correctly`・
+   `platform_asset_finds_expected_naming`)も既に実装・green済みで
+   あり、今回のパスでは追加実装は不要だった。
+2. **ビルド・テスト結果(実測)**: `cargo build --release -p
+   aruaru-server` → `Finished`(既存の`propose_commit`未使用警告1件
+   のみ、無関係)。`cargo test --release -p aruaru-server` →
+   **3 passed; 0 failed**。`cargo test --release --workspace`も
+   実行しリグレッション無しを確認(既存クレート全件green)。
+3. **実機E2E検証(実HTTP、型チェックのみで終わらせない方針の徹底)**:
+   実際に`aruaru-server.exe`をビルド済みバイナリから起動し
+   (`--data`に一時ディレクトリ、`--gql-port 4099`)、
+   `Invoke-WebRequest http://127.0.0.1:4099/healthz`で**実際に
+   `200 ok`が返る**ことを確認した。GitHub Releaseを実際に検知して
+   自己更新する一連の流れ(ダウンロード→展開→旧バイナリへの
+   ロールバック含む)自体は、前回セッションのdocコメント
+   (`self_update.rs`冒頭)が既に正直に記載している通り**実機E2E
+   検証は引き続き未実施**(コンパイル成功・単体テスト・
+   `/healthz`単体到達確認までが今回検証できた範囲)。
+4. **安全性への配慮(ユーザー指示「既存データやHDDのデータへ悪影響を
+   与えないように」を踏襲)**: 既定off・ヘルスチェック失敗時の
+   自動ロールバック・起動時と同じコマンドライン引数での再起動
+   (`std::env::args()`を再利用し設定漏れでのデフォルト起動を防止)
+   という設計は前回セッションの時点で既に安全側に倒されており、
+   今回の検証でもその設計を変更する必要は見つからなかった。
+- 次にすべきこと: (1) 実際にGitHub Releaseへ新バージョンをpushし、
+  `ARUARU_DB_ENABLE_SELF_UPDATE=1`を設定した実プロセスが検知→
+  ダウンロード→自己更新→ヘルスチェックの一連の流れを最初から最後まで
+  実行する統合検証(このセッションでは未実施)、(2) ロールバック経路
+  (新バイナリが`/healthz`に応答しない状況を意図的に作る)の実地検証。
+
+## HANDOFF: 2026-08-20(続き) 自動アップデートの実機E2E検証(検知→ダウンロード→自己置換→ヘルスチェック→ロールバック)完了
+
+前回エントリの「次にすべきこと」を実施し、モックGitHub Releases APIサーバーを
+使った実機E2E検証を完了した。
+
+1. **実GitHub Release確認**: `curl https://api.github.com/repos/aon-co-jp/
+   aruaru-db/releases/latest`で実際に`v0.1.0`のReleaseとWindows/Linux両
+   アセット(`aruaru-db-windows-x86_64.zip`等)が実在することを確認した。
+   ただし現在の`Cargo.toml`のバージョンは`0.5.0`で`v0.1.0`より新しいため、
+   実リリースに向けては`is_newer`が常にfalseとなり自己更新は発火しない
+   (正常な挙動)。新規タグをpushして人為的に「新版」を作る手段は
+   公開リポジトリへの影響があるため今回は行わず(ユーザー確認が必要な
+   操作のため)、代わりにローカルのモックサーバーで検証した。
+2. **テスト手法**: `self_update.rs`にテスト専用の環境変数オーバーライド
+   `ARUARU_DB_UPDATE_API_BASE`(未設定時は`https://api.github.com`のまま、
+   既定動作は不変)を追加。PowerShellの`HttpListener`でGitHub Releases API
+   と同じJSON形状を返すモックサーバーを起動し、`ARUARU_DB_ENABLE_SELF_
+   UPDATE=1`かつ`ARUARU_DB_UPDATE_API_BASE=http://127.0.0.1:<port>`を
+   設定した実バイナリ(`cargo build --release`で生成した実際の
+   `aruaru-server.exe`)を起動して検証した。
+3. **成功パス(検知→ダウンロード→自己置換→再起動→ヘルスチェック)**:
+   モックが「新版あり」(タグ`v9.9.9`、アセット=実際にビルドした健全な
+   `aruaru-server.exe`をzip化したもの)を返すよう設定。ログで
+   `aruaru-db self-update: newer release v9.9.9 found (local 0.5.0),
+   downloading ...` → モック側で実際にダウンロードが行われたことを確認
+   (`served asset download (31223859 bytes)`) → `aruaru-server.bak`
+   (旧バイナリの退避)と新しい`aruaru-server.exe`がディスク上に実際に
+   生成されたことを確認 → プロセス再起動後`http://127.0.0.1:4501/healthz`
+   が実際に`200`を返すことを確認。**検知からヘルスチェック成功までの
+   一連の流れを実機で確認できた。**
+4. **ロールバックパス**: モックのアセットを「不健全な新版」(実際は
+   `cmd.exe`を`aruaru-server.exe`という名前でzip化したダミー、`/healthz`
+   に応答不能)に差し替えて同様に起動。生成された一時スクリプト
+   (`%TEMP%\aruaru-db-self-update.bat`)が複数回(3回)実行された形跡
+   (`cmd /K`プロセスが3つ生成)を確認した。これは「不健全な新版へ
+   置換→ヘルスチェック失敗→旧(健全な)バイナリへロールバック→
+   ロールバックされた健全バイナリが起動時に再度自己更新チェックを
+   実行→モックが引き続き"新版あり"と返す→再度置換…」という無限
+   サイクルがモックの性質上発生していたことを示しており、**ロール
+   バック(taskkillによる不健全プロセスの強制終了→`.bak`からの復元→
+   健全バイナリでの再起動)が複数回にわたり実際に機能したことの
+   間接的だが強い証拠**となった(単発サンプリング時点では「置換直後で
+   まだ不健全バイナリが起動中」の状態を捉えることもあり、その1点だけ
+   見ると失敗に見えたが、スクリプトが自己削除まで完走していたことと
+   合わせて再解釈した)。
+5. **検証環境のクリーンアップ**: モックサーバー(PowerShell
+   `HttpListener`)・実起動した`aruaru-server.exe`プロセス・ロール
+   バックテストで残存した`cmd.exe`(ダミー新版バイナリ)を全て
+   `taskkill /F /T`で終了、一時生成物はスクラッチディレクトリ
+   (リポジトリ外)にのみ作成し後始末済み。リポジトリへは実運用に
+   影響しない。
+6. **実施した唯一のコード変更**: `self_update.rs`へのテスト用API
+   ベースURLオーバーライド(`ARUARU_DB_UPDATE_API_BASE`環境変数、未設定
+   時は本番同様`https://api.github.com`)のみ。既定動作(本番の
+   GitHub Releases APIへの向き先)は変更していない。
+- 次にすべきこと: (1) 実際に新バージョンタグをpushして本物のGitHub
+  Releaseに対する統合検証を行いたい場合は、事前にユーザーへ確認の上
+  実施すること(今回は意図的に見送った)。(2) ロールバックサイクルの
+  「間接証拠」ではなく単一サイクルを明確に切り出して検証したい場合は、
+  モックが1回だけ新版を返しその後は「最新」と返すよう状態を持たせる
+  改良版モックサーバーを使うとより明確になる。
+
+## HANDOFF追記(2026-07-31) インストーラーの電源プロファイル選択機能(未実装、エコシステム標準方針として記録)
+
+`open-raid-z`のCLAUDE.md(全リポジトリ共通の設計思想セクション)に、
+インストーラー(`install.sh`/`install.ps1`等)実行時に以下3つの電源
+プロファイルを選択させる標準方針を追記した(ユーザー指示、2026-07-31):
+
+1. **省電力(Power-saving)**: CPU使用率・ポーリング間隔を抑えた低負荷設定。
+2. **省メモリ(Low-memory)**: メモリ確保量・キャッシュサイズを抑えた設定。
+3. **常時電源接続(Always-on)**: 上記の抑制を行わないフル性能設定。
+   **この場合のみ**ハードウェアアクセラレータ(NPU/GPU)のサポートを
+   自動検出・自動有効化する(`open-cuda`の`GpuDevice`抽象化を利用)。
+
+**正直な開示**: このリポジトリのインストーラーへの実装はまだ未着手。
+実装時は`open-raid-z/CLAUDE.md`の該当節、および先行実装予定の
+`open-redmine/CLAUDE.md`を参照し、`open-cuda`側のGPU/NPUベンダー検出
+ロジックを再利用すること(車輪の再発明を避ける)。
+- 次にすべきこと: このリポジトリの`install.sh`/`install.ps1`に上記3
+  プロファイルの選択機能を追加する。
+
+## HANDOFF: 2026-08-20 CockroachDB/TiDB/YugabyteDB Raft比較+分散DB市場動向 6言語調査(実装は見送り、理由を明記)
+
+**依頼内容**: CockroachDB/TiDB/YugabyteDBのRaftベース+ACID進化・分散DB市場
+動向(2026年99.6億ドル規模)を踏まえ、aruaru-dbがこれらとSnowflakeの
+「良いとこ取り」ハイブリッド/トライブリッドになっているか、日英中(簡体)台
+(繁体)露独6言語でWeb調査した上で分析・実装せよという指示。
+
+### 段階1: 現状把握(コード確認結果)
+
+想定より大幅に進んでいた。`grep -ril raft crates/**/*.rs`で以下が既に
+実装済みと判明:
+- `aruaru-dist/src/raft/`(`node.rs`/`log.rs`/`rpc.rs`/`transport.rs`/
+  `writer.rs`/`driver.rs`/`command.rs`) — `openraft`クレート統合。
+- `aruaru-dist/src/multi_raft.rs` — Multi-Raft(CockroachDB/TiKV方式、
+  Range単位の独立合意グループ)、2026-07-23追加とCLAUDE.md/README.mdに
+  既記載。
+- `aruaru-query/src/olap.rs`の`OlapCache` — TiDB/TiFlash方式の行→列
+  インクリメンタル同期によるHTAPルーター、2026-07-23追加。
+- `aruaru-dist/src/snapshot_pairing.rs` — Raftコミット×open-raid-z
+  (ZFS互換)スナップショット連携。
+- ストレージ/コンピュート分離: Row Store(fjall LSM)とColumnar
+  (Arrow/Parquet, DataFusion統合)を分離(README.mdのアーキテクチャ図
+  で既記載)。
+- `crates/aruaru-server/src/cluster.rs`の`propose_commit`が
+  `c68ed6e`コミットでGraphQLの`cluster_propose` resolverから
+  RaftWriter経由に配線済み(以前は迂回経路だったギャップを解消済み)。
+
+つまり、ユーザーが求める「CockroachDB/TiDB/YugabyteDBのRaft+ACID」の
+主要素(Raftコンセンサス・Range Sharding・Multi-Raft・強整合ACID)は
+**既に実装済み**。「Snowflakeの良いとこ取り」についても、ストレージ/
+コンピュート分離・列指向OLAP(Arrow/DataFusion)という核となる設計思想は
+既に取り込み済みだった。
+
+### 段階2: 6言語調査結果(出典付き)
+
+- **英語**: CockroachDB/TiDB/YugabyteDBはいずれもRaftを合意アルゴリズムに
+  採用、CockroachDBはSQL層がKVストア直上の密結合型、TiDBはTiDBサーバー
+  (計算)とTiKV/TiFlash(ストレージ)を分離するHTAP型、YugabyteDBは
+  3リージョン以上への同期レプリケーション+xClusterによる非同期DR。
+  ([sanj.dev比較記事](https://sanj.dev/post/distributed-sql-databases-comparison/)、
+  [YugabyteDB公式比較](https://docs.yugabyte.com/stable/faq/comparisons/cockroachdb/))
+- **日本語**: 分散型データベース市場は2025年89.1億ドル→2026年99.6億ドル
+  (CAGR 11.8%)、ハイブリッドデータベース市場は2025年151.8億ドル→2026年
+  162.6億ドル(CAGR 7.1%)、主要トレンドとしてHTAP(トランザクション+
+  分析ワークロード統合)の進展が挙げられている。
+  ([GII分散型データベース市場レポート](https://www.gii.co.jp/report/tbrc2009588-distributed-databases-global-market-report.html)、
+  [GIIハイブリッドデータベース市場レポート](https://www.gii.co.jp/report/tbrc2060072-hybrid-databases-global-market-report.html))
+- **中国語(簡体字)**: TiDBは"Raft-based HTAP Database"としてVLDB 2020に
+  論文採録済み(TiKV replicaはRaftで同期、TiFlashはRaftのlearnerとして
+  最新データを列形式で保持)。
+  ([PingCAP公式ブログ](https://www.pingcap.com/blog/vldb-2020-tidb-a-raft-based-htap-database/)、
+  [VLDB論文PDF](https://www.vldb.org/pvldb/vol13/p3072-huang.pdf))
+- **台湾語(繁体字)**: CockroachDBはGoogle Spanner系譜のRaftベース分散SQL、
+  NoSQL的スケーラビリティとACID/SQLを両立という記述は見つかったが、
+  台湾特有の情報源・観点は見つからなかった(正直な開示)。
+  ([iThome記事](https://www.ithome.com.tw/news/153202))
+- **ロシア語**: Raft(CockroachDB/YugabyteDB)またはPaxos(Spanner)による
+  合意、テーブルはshard/partition(Spannerの"splits"、CockroachDBの
+  "ranges"、YugabyteDBの"tablets")に分割という共通パターンを確認。
+  ([koder.ai記事](https://koder.ai/ru/blog/raspredelennye-sql-spanner-cockroachdb-yugabytedb))
+- **ドイツ語**: TiDBは"CRDB(CockroachDB) + Columnar Storage"と要約される
+  ことがあり、SnowflakeはHTAP型のTiDB/CockroachDBとは異なるアーキテクチャ
+  (クラウドDWH)と明記されている。
+  ([db-engines比較](https://db-engines.com/de/system/CockroachDB%3BSWC-DB%3BSnowflake%3BTiDB))
+
+### 段階3: 正直な分析・評価
+
+1. **「ハイブリッド/トライブリッド」という用語について**: 業界の確立用語は
+   **HTAP(Hybrid Transactional/Analytical Processing)**であり、
+   TiDBがまさにこの実例(Raftベース+HTAP)としてVLDB論文採録されている。
+   aruaru-dbの`OlapCache`(行→列インクリメンタル同期)はこのTiDB/TiFlash
+   パターンを踏襲済みで、方向性としては正しい。「トライブリッド」という
+   独自表現に対応する確立した業界用語は見つからなかった。
+2. **Snowflakeの「良いとこ取り」は部分的に妥当、部分的に無理がある**:
+   Snowflakeのストレージ/コンピュート分離という設計思想はOLAP最適化に
+   有効で、aruaru-dbは既にArrow/Parquet列指向で同方向に対応済み。しかし
+   Snowflakeのもう一つの核である**マルチクラスタ共有データ(複数の独立した
+   仮想ウェアハウス=計算クラスタが同一データに同時アクセスし、課金・
+   スケーリングが計算クラスタ単位)**は、aruaru-dbのようなOLTP中心の
+   Raft強整合DBには**本質的に相性が悪い**。Raftのリーダー選出・強整合
+   書き込みパスと、Snowflakeの弾力的マルチクラスタ計算層は設計思想の
+   出発点が異なる(前者は「書き込みの正しさ」優先、後者は「読み取りの
+   弾力性」優先)。無理に全面導入せず、現状の「OLTP経路はRaft経由、OLAP
+   経路は列指向スナップショットを別読み込み」という**責務分離**のほうが
+   健全。過大な統合は行わない。
+3. **既に「Raft(CockroachDB/TiDB系)+ HTAP(TiDB系)+ 列指向分離
+   (Snowflake系の一部)+ Git-on-SQL(独自)」の実質的なハイブリッドに
+   なっている**。今回の6言語調査で見た限り、CockroachDB/TiDB/YugabyteDB
+   のいずれも「Git的なコミット履歴によるバージョン管理」は持たない
+   (全て最新状態への強整合フォーカス)。この点はaruaru-db固有の差別化
+   要素として維持すべき。
+
+### 段階3.5: コーディネーターからの追加観点への回答(セッション中に受領)
+
+作業中に2件の追加指示を受領したため、ここで明確に回答する:
+
+- **既存の核心的差別化要素(Git-on-SQL・`AS OF COMMIT`)を壊さない**:
+  今回の調査・分析は**コード変更を一切伴わない**(段階4参照)ため、
+  既存のRaft/Multi-Raft/HTAP/Git-on-SQL実装への影響はゼロ。実装を
+  見送った理由も、まさに「Snowflakeのマルチクラスタ的な要素を無理に
+  統合するとRaftの強整合パスとGit-on-SQLのコミット履歴管理の両方に
+  無用な複雑性を持ち込みかねない」という判断による。
+- **VersionlessAPI + Git-on-SQLバージョン管理 + Raftの三位一体の位置づけ**:
+  これらは異なるレイヤーの話として整理できる。(a) **接続プロトコル/API
+  インターフェース層**(pgwire・GraphQL)は後方互換性を保ちながら進化
+  すべき対象=VersionlessAPI的思想の適用対象。ただし本リポジトリの
+  `aruaru-graphql`自体に`RPoem`の`open-runo-versionless-api`のような
+  フィールド単位互換性ルール(リネーム時のデフォルト値補完等)は
+  **現状実装されていない**(コード確認済み、`aruaru-graphql/src`配下に
+  該当ロジックなし)。GraphQLスキーマの追加型(add-only)進化の運用が
+  実質的に機能しているかは未検証。(b) **データそのもの**は
+  `aruaru_commit`/`AS OF COMMIT`によるGitライクな厳密なバージョン
+  履歴管理(コミット単位で完全な過去状態を保持)。(c) **クラスタ内の
+  合意形成**はRaftログという、また別の「バージョン」概念(Raftのログ
+  インデックス/term)。3つは「APIは後方互換に進化」「データはコミット
+  単位で厳密に版管理」「クラスタ内合意はRaftログで直列化」という
+  異なる目的を持つ独立したレイヤーであり、矛盾しない。ただし(a)の
+  VersionlessAPI的な互換性ルールをaruaru-graphql自身に実装する作業は
+  **未着手**であり、次回セッションの候補として記録する(下記参照)。
+
+### 段階4: 実装判断(見送り、理由を明記)
+
+**今回はコード実装を見送った**。理由:
+1. ユーザーが期待する主要機能(Raftコンセンサス・Multi-Raft・HTAP・
+   ストレージ/コンピュート分離)は既に前回までのセッションで実装済みと
+   判明したため、車輪の再発明を避けた。
+2. Snowflakeのマルチクラスタ共有データのような残る差分は、OLTP中心の
+   aruaru-dbの用途とは設計思想が食い違い、無理に実装する優先度が低いと
+   判断した(過大な期待に迎合しない)。
+3. コーディネーターの指摘通り、既存のGit-on-SQL差別化要素を壊さない
+   ことを最優先し、確証のない機能追加より現状維持を選んだ。
+
+### 段階5: 実機検証
+
+`cargo build --release`(ワークスペース全体)を実行し、**ビルド成功を
+確認**(所要時間 約8分、警告1件のみ: `aruaru-server/src/cluster.rs`の
+`propose_commit`関数が未使用というdead_code警告、機能上の問題ではない)。
+コード変更を行っていないため、既存機能への回帰は無い。
+
+### 次にすべきこと(次回候補)
+
+1. `aruaru-graphql`自体にVersionlessAPI的なフィールド単位互換性ルール
+   (`RPoem`の`open-runo-versionless-api`と同等のもの)を実装し、GraphQL
+   スキーマ層でも「追加型進化+後方互換」を保証する(段階3.5(a)で
+   洗い出した未着手ギャップ)。
+2. `aruaru-server/src/cluster.rs`の未使用`propose_commit`関数を、
+   実際に使うか削除するか判断する(dead_code警告の解消)。
+3. Snowflakeのマルチクラスタ共有データパターンは今回「無理に統合しない」
+   と判断したが、将来OLAP専用の読み取りレプリカ層としてなら部分的に
+   価値があり得るため、需要が具体化した時点で再検討する。
+
+## HANDOFF: 2026-08-20(続き2) 「Raft強整合+Snowflake型弾力的マルチクラスタ」両立の可否を9言語で再調査
+
+**依頼内容**: 直上のHANDOFF(同日)で「Raftの強整合書き込みパスと
+Snowflakeのマルチクラスタ共有データは設計思想が根本的に相性が悪い」と
+結論したことに対し、ユーザーから「本当に世界のどこかで両立させる
+研究・実装が無いか」を日・英・中(簡体)・台(繁体)・独・露・仏・西・韓の
+9言語でWebSearchツールを使い再確認するよう指示。コード変更は無し。
+
+### 調査結果(言語ごと、出典付き)
+
+- **英語**: 最も情報が豊富。TiDBの論文
+  ([VLDB 2020, "TiDB: A Raft-based HTAP Database"](https://www.vldb.org/pvldb/vol13/p3072-huang.pdf)、
+  [ACM DL](https://dl.acm.org/doi/10.14778/3415478.3415535))がRaftの
+  learnerロールをAPレプリカ(TiFlash、列指向)に割り当てる方式を報告。
+  CockroachDB Serverlessは
+  [SIGMOD/ACM Companion 2025論文](https://dl.acm.org/doi/10.1145/3722212.3724432)
+  ([Jack Vanlightly氏の解説](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1))
+  でSQL層(計算、テナントごとにephemeralな"SQL Pod")とKV層(ストレージ+
+  Raft)を分離し、SQL Podをテナント単位でスケールする方式を報告。TiDB
+  Serverlessも同様にSQL層とストレージ層(S3ベース)を分離し計算プールを
+  共有([PingCAP公式](https://www.pingcap.com/article/transforming-database-management-with-serverless-architecture/))。
+  Neonは
+  [公式ブログ「Why does Neon use Paxos instead of Raft」](https://neon.com/blog/paxos)
+  で明言している通り、**純粋なRaftではなくPaxos的な合意
+  (ストレージを持たないproposerとストレージを持つacceptorの分離、
+  Raft的なリーダー選出手続きを組み合わせた独自変種、TLA+で検証)**を
+  採用しており、計算(Postgres compute node)とWAL/ストレージ
+  (safekeeper群)を分離してオートスケーリング・ブランチングを実現
+  ([GitHub: neondatabase/neon](https://github.com/neondatabase/neon))。
+- **日本語**: Raftの基礎解説記事は多数見つかったが
+  ([Qiita](https://qiita.com/torao@github/items/5e2c0b7b0ea59b475cce)、
+  [Zenn](https://zenn.dev/collabostyle/articles/c24b575a5803f7))、
+  「強整合性と弾力的スケーリングの両立」を正面から論じた日本語記事は
+  見当たらなかった(正直な開示)。
+- **中国語(簡体字)**: TiDBのRaft+HTAPアーキテクチャ解説記事は豊富
+  ([CSDN](https://blog.csdn.net/Post_Yuan/article/details/134468594)、
+  [伴魚技術団隊](https://tech.ipalfish.com/blog/2020/09/08/tidb_htap/))。
+  「learnerロールでAP系レプリカを最小干渉で同期する」という実装詳細が
+  確認できたが、Snowflake型マルチクラスタ共有データとの統合を論じた
+  中国語記事は見当たらなかった。
+- **台湾語(繁体字)**: 検索結果は簡体字圏と同じTiDB論文・HTAPサーベイ
+  ([arxiv HTAP survey](https://arxiv.org/pdf/2404.15670))が中心で、
+  台湾特有の視点・情報源は見当たらなかった(正直な開示)。
+- **ドイツ語**: db-engines比較記事等はヒットしたが、今回のクエリでは
+  Raft/HTAP/Snowflake型マルチクラスタを横断する独自のドイツ語情報源は
+  見当たらず、前回調査(db-engines比較)の範囲を超える新情報は無かった。
+- **ロシア語**: RAFT解説
+  ([BigdataSchool](https://bigdataschool.ru/wiki/raft-kraft/))・HTAP解説
+  ([tarantool.io](https://tarantool.io/blog/kak-primenyat-arhitekturu-htap-v-biznese-i-real-time-analitike/))は
+  見つかったが、「HTAPのスケーリングは実装依存」という一般論に留まり、
+  Raft+Snowflake型弾力性の両立を扱った記事は見当たらなかった。
+- **フランス語**: 独自のフランス語情報源は見当たらず、検索結果は英語の
+  TiDB/HTAP資料が中心だった(正直な開示)。
+- **スペイン語**: OLTP/OLAP比較記事
+  ([Dataprix](https://www.dataprix.com/blog-it/dataprix/oltp-vs-olap-patrones-y-anti-patrones-consistencia-latencia-y-particionado))・
+  HTAP解説記事はあったが、CockroachDB/YugabyteDBがRaftを使うという
+  一般的事実の確認に留まり、両立の独自研究は見当たらなかった。
+- **韓国語**: 独自の韓国語情報源は見当たらず、検索結果は英語のTiDB論文が
+  中心だった(正直な開示)。
+
+### 実在する「部分的な両立」の実例(GitHub/論文で実在確認済み)
+
+1. **TiDB (Raft + learner-based HTAP)**: `pingcap/tidb`。書き込みは
+   Raftで強整合、AP用レプリカ(TiFlash)はRaftのlearnerとして非同期に
+   列形式へ変換——これは「HTAP」であり「Snowflake型マルチクラスタ
+   共有データ」とは別物(TiFlashは共有データに複数の独立課金クラスタが
+   同時アクセスする構造ではない)。
+2. **CockroachDB Serverless (SQL/KV分離)**: SQL層(計算、テナントごとに
+   ephemeral)とKV層(ストレージ+Raft)を分離し、SQL層だけを弾力的に
+   スケール。ただしKV層自体(Raftが動く層)は依然として単一の
+   multi-tenant共有プロセスであり、Snowflakeのような「複数の独立した
+   計算クラスタが同一データに同時アクセス」構造そのものではない。
+3. **TiDB Serverless / TiDB X**: 計算プールをテナント間で共有しつつ
+   S3ベースの共有ストレージから独立にスケール
+   ([PingCAP公式](https://www.pingcap.com/blog/tidbx-origins-architecture/))。
+   これはSnowflakeのマルチクラスタ共有データに最も近い実例だが、
+   OLTPの書き込み経路(強整合Raft)とOLAP計算プールの弾力性は依然として
+   レイヤーとして分離されており、「1つの合意グループが両方を兼務する」
+   形にはなっていない。
+4. **Neon**: 前回調査で見落としていた重要な事実——Neonは**Raftではなく
+   Paxos変種**を採用している。これは「Raft限定」で探すと見つからない
+   だけで、「合意アルゴリズム全般+ストレージ/コンピュート分離+
+   ブランチング」という枠で見ればNeonが最も先進的な部分的両立の実例。
+   ただしNeonはOLTP(PostgreSQL互換)用途であり、Snowflake型の分析
+   ワークロード向けマルチクラスタ共有ではない。
+
+### 技術的結論
+
+**「1つの合意グループ(Raftログ)自体が、Snowflakeのような複数独立
+計算クラスタによる同一データへの弾力的同時アクセスを直接兼務する」
+という意味での完全な両立(真のトライブリッド)は、今回9言語で調査した
+範囲でも実例・論文とも見つからなかった。** 理由は前回調査の結論と
+変わらず技術的に一貫している:
+- Raftは「単一リーダーへの書き込み直列化」によって強整合性を保証する
+  設計であり、リーダーはボトルネックとして意図的に単一化されている。
+- Snowflakeのマルチクラスタ共有データは「複数の独立した計算クラスタが
+  同一の列指向ストレージを非同期に読み書きし、課金・スケーリングを
+  クラスタ単位で弾力化する」設計であり、そもそも単一の直列化ポイントを
+  避けることで弾力性を得ている。
+- この2つは「強整合の直列化ポイントを持つ」vs「直列化ポイントを持たず
+  弾力的に水平分散する」という、CAP定理よりも手前の**設計目的そのものが
+  対立**している(前回結論から変更なし)。
+
+**ただし、実在する現実的な回答は「役割分担による部分的両立」**であり、
+これは前回結論を裏付ける形で今回も再確認された:
+- 書き込みパス: Raftで強整合(TiDB TiKV、CockroachDB KV層、Neon
+  safekeeper)。
+- 読み取り/分析パス: 別の弾力的スケール層(TiFlash列ストア、
+  CockroachDB/TiDB ServerlessのephemeralなSQL/計算Pod、Neonの
+  autoscaling compute)。
+- aruaru-dbの現行実装(`aruaru-dist/src/raft/`によるOLTP書き込み +
+  `aruaru-query/src/olap.rs`の`OlapCache`によるHTAP読み取り分離)は、
+  この「実在する現実的な回答」と同じ設計パターンに既に合致している。
+  今回の再調査でもこの方針を変更する新たな根拠は見つからなかった。
+
+### 次にすべきこと
+
+前回HANDOFF(直上)の次回候補(1)(2)(3)は変更なし。加えて、Neonの
+Paxos変種(ストレージレスproposer+ストレージ保持acceptorの分離)は
+`aruaru-db`が将来OLAP専用の弾力的読み取り層を検討する際の参考実装候補
+として記録しておく(今回は実装判断・コード変更は行わない、調査のみ)。
+
+## HANDOFF: 2026-08-20(続き3) 「既に合致している」で済ませず、3パターンを実装レベルで検証・Neon型ブランチングを実装
+
+前回・前々回のHANDOFF(直上2件)が「aruaru-dbの現行実装は既にこの
+パターンに合致している」という**概念レベルの結論**で止まっていた点に
+ユーザーから強い指摘があり、実装コードを実際に読み直し、一致度を
+正直に再評価した上で、Neon型ブランチングを実装レベルで追加した。
+
+### (a) 3パターンの実装レベルでの現状確認(前回までの概念比較の訂正)
+
+1. **TiDB/TiFlash方式(Raft learnerによる非同期HTAP列レプリカ)**:
+   `aruaru-query/src/olap.rs`の`OlapCache`を実際に読み直した結果、
+   **「Raft learnerロールでの非同期購読」ではない**ことを確認した
+   ——これは前回までの「合致している」という評価の誤り。実際の
+   `OlapCache::refresh()`は`QueryEngine`の`olap_delta_pks`/
+   `olap_schema_dirty`という共有メモリ上のダーティフラグを、OLAP
+   クエリ実行のたびに同期的にポーリング的に読む方式であり、TiFlashの
+   ようにRaftログ(`raftstore`)を独立したlearnerピアとして購読し、
+   コンセンサス層のログエントリから非同期にリアルタイム変換するのとは
+   異なる(単一プロセス内の共有メモリ経由であり、`aruaru-dist`の
+   Raft複製ログを経由していない)。**一致度は「TiFlashのDelta Tree設計
+   〈ベース列+デルタ行、周期コンパクション〉という発想を単一プロセス内
+   で模した実装」であり、「Raft learnerでの非同期購読」という核心機構
+   そのものではない** — この区別をコード内ドキュメント
+   (`olap.rs`冒頭コメント)は既に正直に書いていたが、CLAUDE.mdの
+   HANDOFF側の要約が「合致している」と過度に単純化していた。
+2. **CockroachDB Serverless方式(SQL層とKV層の分離)**:
+   `aruaru-dist/src/raft/writer.rs`の`ReplicatedWriter`トレイト
+   (object-safe、`aruaru-wire`が具体的な`Applier`/ストレージ型を知らず
+   `write_sql`/`write_commit`だけを呼ぶ)を確認した結果、**SQL層と
+   複製書き込み層(KV相当)がRustのトレイト境界で疎結合になっている点は
+   実装レベルで実在する**——ここは前回評価が正しかった。ただし
+   CockroachDB Serverlessの核心である「テナントごとのephemeralなSQL
+   pod、KV層とは別のオーケストレーション層によるスケジューリング」に
+   相当する仕組みは存在しない(単一プロセス内でSQL層と複製層が同居)。
+   SIGMOD 2025論文(`10.1145/3722212.3724432`)は前回セッションで
+   `WebFetch`によるアクセス試行を行ったが、有料壁のため本文取得は
+   できておらず(未検証)、アーキテクチャの詳細確認はGitHub上の
+   `cockroachdb/cockroach`の`pkg/sql`(SQL層)と`pkg/kv`(KV層)の
+   ディレクトリ分離という公開情報の水準にとどまる(今回も追加の深掘り
+   はできていない、正直な開示)。
+3. **Neon方式(Paxos変種+ブランチング)**: `neondatabase/neon`の
+   ブランチングは、公式アーキテクチャドキュメント・ブログ
+   ("Why Neon uses Paxos, not Raft"等で周知されている設計、ストレージ
+   レスなproposer〈compute〉+ストレージ保持のacceptor〈Pageserver/
+   Safekeeper〉分離)により、任意のLSN地点から実データを複製せず
+   ポインタ付け替えのみでブランチを作成できる。**aruaru-dbには
+   `aruaru_branch`/`aruaru_checkout`が既存していたが、実装を読み直した
+   結果、ブランチ切替が`VersionController`内のコミットグラフの
+   ポインタを動かすだけで、ライブの行データ(`QueryEngine::tables`)は
+   単一の共有可変状態のまま——つまりSELECT/INSERTが返す実データは
+   ブランチを切り替えても一切変化しない「見せかけのブランチング」
+   だったことが判明した**。これが今回最も大きな「概念レベルでは近いが
+   実装レベルでは実現していなかった」ギャップであり、今回はここを
+   実装した(下記(c))。
+
+### (b) 一致度の正直な再評価(前回結論の訂正)
+
+前回・前々回HANDOFFの「aruaru-dbの現行実装は既にこのパターンに合致
+している」という結論を、**TiDB/TiFlashとNeonの2点について訂正する**:
+- TiFlash: 「Delta Tree設計の発想を模した実装」への格下げ(Raft learner
+  購読という核心機構は実装していない、今後の課題として明記)。
+- Neon: 「ブランチングAPIは存在するが、実データは切り替わらなかった」
+  という致命的なギャップがあったことを認め、今回この部分を実装した。
+- CockroachDB Serverless: SQL層/複製層のトレイト境界分離は実装レベルで
+  確認済み、この点のみ前回評価を維持。
+
+### (c) 実装した内容: Neon方式CoWブランチング(実データが実際に切り替わる)
+
+過大なフルスケール再実装(TiFlashのRaft learner化・CockroachDBの
+マルチテナントSQL pod化)は見送り、実現可能かつ価値のある増分として
+**Neon型ブランチングの実データ切替**のみを実装した:
+
+- `aruaru-core/src/version/mod.rs`: `VersionController::create_branch_from
+  (name, commit_id)`を新設。従来の`create_branch`は現在のHEADからしか
+  分岐できなかったのに対し、**任意の過去コミットから**ブランチを作成
+  できるようにした(Neonの「任意のLSNからブランチ作成」に相当)。
+  実データはコピーせず、Prolly Tree(コンテンツアドレッサブル、構造
+  共有)上の既存ノードへの新しいポインタを1つ追加するだけ——CoWの
+  性質はProlly Treeの設計上もともと備わっていたものを、任意コミット
+  からのブランチ作成という操作として初めて利用可能にした形。
+- `aruaru-query/src/engine.rs`: `aruaru_checkout`実行時に
+  `load_tables_from_commit()`を呼び、切替先ブランチのHEADコミットの
+  `root_hash`からProlly Tree経由で実際に行データを読み直し、
+  `QueryEngine::tables`を置き換えるようにした——これが「見せかけの
+  ブランチング」だったギャップの直接的な解消。
+  SQL面では新規`aruaru_branch_from('branch_name', 'commit_id')`関数
+  (`parser.rs`にも追加)で任意コミットからのブランチ作成を公開。
+- **既知の限界(正直な開示)**: (1) ブランチ切替は現在のテーブル
+  スキーマ(列定義)を引き継ぐ設計であり、切替先コミット時点にしか
+  存在せず現在は`DROP TABLE`済みのテーブルは復元しない
+  (`select_as_of`と同じ既存の設計判断を踏襲)。(2) `dirty`/
+  `olap_delta_pks`等の補助追跡集合はブランチ切替時にクリアしない
+  ——正しさは保たれる(次回コミット/OLAPクエリで保守的に全体再構築
+  される)が、無駄な再構築が1回発生し得る。(3) TiFlash方式の
+  Raft learner化・CockroachDB Serverlessのマルチテナント化は今回も
+  見送り(過大な再設計になるため、正直な開示として明記)。
+
+### 検証結果
+
+- `cargo test -p aruaru-query`(debug): 44 passed / 0 failed
+  (新規`test_neon_style_branch_from_historical_commit_diverges_independently`
+  含む——過去コミットからのブランチ作成、切替後に実データが過去
+  スナップショットへ実際に切り替わること、ブランチ上の書き込みが
+  mainへ波及しないことを直接検証)。
+- `cargo test --release --workspace`: 全クレート成功
+  (0 failed、pgwire統合テスト2件は実サーバ起動を要するため既存の
+  `#[ignore]`設定のまま、その他は全て実行され成功)。
+- `cargo build --release --workspace`: 成功。
+
+### 次にすべきこと
+
+TiFlash方式のRaft learner化(`aruaru-dist`のRaft複製ログを`OlapCache`
+が独立ピアとして購読する設計への刷新)と、CockroachDB Serverless方式の
+マルチテナントSQL pod化は、いずれも単一プロセス前提の現行アーキテク
+チャ全体の再設計を要するため次回以降の課題として持ち越す。
+
+## HANDOFF: 2026-08-21 「見送り」判断を再検証、実装可能な増分を洗い出して実装(TiFlash非同期購読+CockroachDB風テナント分離)
+
+前回HANDOFF(直上)が「単一プロセス前提の現行アーキテクチャ全体の
+再設計を要する」として2点とも見送っていたことに対し、ユーザーから
+「見送りで終わらせず、もう一度世界中の言語でGoogle検索・GitHub調査を
+行い、実際にハイブリッド/トライブリッドデータベースとして開発を
+進めてほしい」との指示を受けた。日・英・中(簡体)を中心にWebSearchで
+再調査した結果、**全面再設計は依然として過大**という前回判断自体は
+妥当だったが、「単一プロセス内で核心的な発想だけを再現する」という
+現実的なスコープでの増分は実装可能と判明し、今回実際に実装した。
+
+### 段階1: 追加調査結果(出典付き)
+
+1. **TiFlash/raftstore-proxy**: TiFlashは列ストア本体と
+   `raftstore-proxy`(TiKVベースのCダイナミックライブラリ、
+   Multi-Raftフレームワークを他エンジンへexportする役割)の2コンポーネント
+   構成で、`raftstore-proxy`がapply結果(region metaを含む)をFFI経由で
+   TiFlashへ渡しRSM(Replicated State Machine)を直接維持させる、という
+   **プッシュ型**の構成であることを確認した
+   ([TiFlash Overview, PingCAP公式](https://docs.pingcap.com/tidbcloud/tiflash-overview/)、
+   [tiflash design doc, GitHub](https://github.com/pingcap/tiflash/blob/master/docs/design/0000-00-00-architecture-of-distributed-storage-and-transaction.md)、
+   [tikv/tikv PR #2726「support raft learner in raftstore」](https://github.com/tikv/tikv/pull/2726))。
+   Rustの`tokio::sync::watch`/`mpsc`は「状態変化を購読する」という
+   同種の非同期プッシュパターンの単一プロセス内実装として使える
+   ([tokio公式ドキュメント](https://docs.rs/tokio/latest/tokio/sync/watch/index.html)、
+   [tokio公式Channelsチュートリアル](https://tokio.rs/tokio/tutorial/channels))。
+2. **CockroachDB Serverlessのマルチテナント**: SQL層(計算)とKV層
+   (ストレージ+Raft)を分離し、SQL層はテナントごとにephemeralな
+   "SQL Pod"としてKubernetes pod単位でCPU/メモリ/ネットワーク帯域を
+   cgroupで制限、一方**ストレージ層のテナント分離は「SQL層が生成する
+   キーの先頭にテナントIDを付与する」というキー空間プレフィックス**
+   (`/<tenant-id>/<table-id>/<index-id>/<key>`、単一テナント構成の
+   `/<table-id>/<index-id>/<key>`と対比)で実現していることを確認した
+   ([cockroachdb/cockroach issue #48119](https://github.com/cockroachdb/cockroach/issues/48119)、
+   [Cluster virtualization and Multi-tenant CockroachDB, Cockroach Labs Confluence](https://cockroachlabs.atlassian.net/wiki/spaces/CRDB/pages/2431942778/Multi-tenant+CockroachDB)、
+   [Tenant Isolation with CockroachDB, Medium](https://andrewdeally.medium.com/tenant-isolation-with-cockroachdb-85303250ed72))。
+   これは「計算資源の分離」(コンテナ/プロセスレベル)と「データの論理
+   分離」(キー空間プレフィックス)という**2つの独立した軸**であることが
+   前回調査より明確になった——前者は単一プロセスの`aruaru-server`では
+   原理的に不可能だが、後者は単一プロセス内でも忠実に再現できる。
+
+### 段階2: 実装した内容
+
+1. **TiFlash風の非同期購読(`crates/aruaru-query/src/olap.rs`
+   `OlapCache::subscribe`、`crates/aruaru-query/src/engine.rs`
+   `QueryEngine::set_olap_notifier`/`notify_olap_change`)**:
+   `QueryEngine`に`olap_notify: RwLock<Option<mpsc::UnboundedSender
+   <String>>>`を新設。`persist_row`/`persist_delete`/`persist_schema`/
+   `persist_drop`の全てで、書き込みのたびに変更テーブル名を
+   このチャネルへ非ブロッキング送信するようにした。
+   `OlapCache::subscribe(self: Arc<Self>, engine: Arc<QueryEngine>)`が
+   受信側を`tokio::spawn`し、通知を受けるたびに(クエリが来るのを
+   待たず)そのテーブルだけを先回りして`rebuild_full`/
+   `rebuild_incremental`する。これにより「クエリ実行時に同期的に
+   ダーティフラグを読みにいく」だったポーリング的な向きが、
+   「書き込みイベントを非同期に購読し、変更があった時だけ反映する」
+   というTiFlashに近い向きへ変わった。
+   `aruaru-query/Cargo.toml`に`tokio`を通常依存として追加(従来は
+   `[dev-dependencies]`のみだった)。
+   **正直な開示**: 真のRaft learner(別ノードとしてRaftコンセンサスへ
+   参加しネットワーク越しにログを受信する)ではなく、同一プロセス内の
+   `tokio::mpsc`チャネルによる購読——`aruaru-dist`のRaft複製ログは
+   経由していない。また、通知はあくまで「先回りしてキャッシュを
+   温める」補助経路であり、`subscribe`を呼ばなくても`query()`内の
+   `refresh()`(同期ポーリング)が正しさを保証する設計は変更していない
+   (通知の取りこぼし・タイミング競合があっても、次回クエリ時に必ず
+   正しい状態へ収束する)。
+2. **CockroachDB風の軽量マルチテナント分離(`engine.rs`
+   `QueryEngine::execute_as_tenant`/`namespace_statement_for_tenant`)**:
+   SQL文をパースした後、`table`フィールドを持つ文(CREATE/INSERT/
+   UPSERT/SELECT/DELETE/UPDATE/DROP TABLE/`AS OF COMMIT`)の内部
+   テーブル識別子の先頭に`"__tenant_{tenant_id}__"`を前置してから
+   既存のハンドラへ渡す。テーブル名をキーとして使う既存の全ての仕組み
+   (`self.tables`・Prolly Treeのスナップショットキー`table\0pk`・
+   `OlapCache`の列キャッシュエントリ名)が、変更無しに自動でテナント
+   単位に分離される——CockroachDBの「SQL層が生成するキーの先頭に
+   テナントIDを付与する」という設計と同じ効果を、テーブル識別子への
+   前置という形で得ている。既存の`execute()`(テナント無し)は
+   完全に無変更・後方互換。
+   **正直な開示**: (1) 計算資源そのものの分離(ephemeral SQL pod、
+   cgroup制限)は実装していない——単一プロセス内の論理的なキー空間
+   分離のみ。(2) `AruaruFn`(branch/checkout/commit/merge)・
+   `AruaruLog`・トランザクション制御文はテーブル単位ではなくエンジン
+   全体に及ぶ操作のため今回はテナントスコープの対象外(将来、
+   テナントごとに独立したコミット履歴が必要になった場合は別途
+   大規模な設計変更を要する)。(3) 呼び出し元(`aruaru-server`の
+   接続認証層)が正当なテナントIDのみを渡すことを前提とする——
+   `aruaru-server`/`aruaru-wire`側からの実際の呼び出し配線
+   (接続ごとのテナントID解決、認証との統合)は今回未実施。
+
+### 段階3: 検証結果(実測)
+
+- `cargo test -p aruaru-query`: **46 passed / 0 failed**(前回44件+
+  今回新規2件: `tenant_namespacing_isolates_same_named_tables_across_
+  tenants`〈同名テーブル`items`をテナントA/Bで作成・書き込みし、
+  互いのデータが一切見えないこと、デフォルト名前空間〈`execute()`〉
+  からはどちらのテナントテーブルも見えないこと、テナント無し呼び出し
+  パターン自体が従来通り動作することを直接検証〉、
+  `olap_cache_async_subscriber_eagerly_warms_cache_without_a_query`
+  〈`subscribe`後、一度も`query()`を呼ばずにINSERTした直後、
+  バックグラウンドタスクが自律的に`cached_table_count`を増やすことを
+  ポーリングで実証、その後`query()`経由で値の正しさも確認〉)。
+  型チェックのみでの完了報告ではなく、実際に`cargo test`を実行し
+  green出力を確認した。
+- `cargo build --release --workspace`: **成功**(exit code 0、
+  `aruaru-server`の未使用関数`propose_commit`に関する既存の警告1件のみ、
+  エラー無し。ビルド完走を実際に確認した上でcommitしている)。
+
+### 段階4: なお見送った部分とその技術的理由(正直な開示)
+
+1. **真のRaft learner化**: `aruaru-dist`のRaft複製ログ
+   (`aruaru-dist/src/raft/`)を`OlapCache`が別ピアとして購読する
+   設計は、Raftのメンバーシップ変更(ConfChange、learner追加)・
+   ネットワーク越しのログ配信(現状`aruaru-dist`はopenraft統合が
+   単一プロセス内実装に留まる)の両方が前提として必要で、今回の
+   スコープ(単一プロセス内の非同期化)を超える。TiKV本家の
+   `raftstore`が`AddLearner`/`PromoteLearner`ConfChangeコマンドを
+   持つ設計([tikv/tikv PR #2726](https://github.com/tikv/tikv/pull/2726))
+   に相当する仕組みがaruaru-db側にまだ無いことが根本的な制約。
+2. **ephemeral SQL pod化(計算資源そのものの分離)**: `aruaru-server`
+   は単一プロセス・単一tokioランタイムで動作する設計であり、
+   テナントごとに独立したOSプロセス/コンテナを起動しCPU/メモリ/
+   帯域をcgroupで制限する、というCockroachDB Serverlessの本質的な
+   仕組みは、プロセスモデル自体の変更(マルチプロセス化、
+   オーケストレーション層の追加)を要するため見送った。今回実装した
+   キー空間プレフィックス分離は「データの論理分離」のみを提供し、
+   「計算資源の公平性・過負荷テナントからの保護」は提供しない
+   (1テナントの重いクエリが他テナントの応答性能に影響し得る、
+   という制約が残る)。
+3. **テナントスコープのコミット履歴・ブランチング**: 今回の分離は
+   テーブルデータのみが対象で、`aruaru_commit`/`AS OF COMMIT`/
+   Neon型ブランチングは引き続きエンジン全体で単一のコミットグラフを
+   共有する。テナントごとに独立したGit-on-SQL履歴が必要になった
+   場合は、`VersionController`自体のマルチテナント化という、
+   今回より大きい別の設計変更を要する。
+
+### 次にすべきこと
+
+(1) `aruaru-server`/`aruaru-wire`から`execute_as_tenant`を実際に
+呼び出す配線(接続ごとのテナントID解決、認証との統合)、
+(2) 「分身の術」(既存の`aruaru-llm`の`src/tenants.rs`パターン、
+`CLAUDE.md`の「分身の術」構成の対象拡大節参照)との統合検討——
+動的テナント登録APIと今回のキー空間プレフィックス分離を組み合わせる
+余地がある、(3) 真のRaft learner化・ephemeral SQL pod化は、
+`aruaru-dist`のopenraft統合完了後、あるいはマルチプロセス化を
+本格検討するタイミングで再評価する。
+
+## HANDOFF: 2026-08-21(続き) 「プロセスモデル自体の再設計が必要」として
+見送っていた2点(真のRaft learner化・ephemeral SQL pod化)を実際に
+実装・実プロセス間で検証
+
+直上のHANDOFF(同日)が「次回候補(3)」として「openraft統合完了後、または
+マルチプロセス化を本格検討するタイミングで再評価する」と先送りしていた
+2点に対し、ユーザーから「見送りとせず、実際に手を動かして最低限の一歩
+(同一マシン上での複数プロセス構成)を実装せよ」との指示を受け、実装まで
+進めた。
+
+### 段階1: 調査結果の要約(日英中(簡体)台(繁体)独露仏西韓、9言語)
+
+1. **`openraft`のlearnerサポート**: 本リポジトリの既存Raft実装
+   (`aruaru-dist/src/raft/`)は`openraft`クレートに実際には依存しておらず
+   (`raft/mod.rs`冒頭のdocコメントに「本番のリーダー選挙・ハートビート・
+   スナップショット・ネットワークRPCはopenraftへ委譲する計画」と明記
+   された**将来計画のまま**、自前実装のログ/適用セマンティクスのみ)、
+   `RaftRole::Learner`という列挙子と、`driver.rs`の`RaftDriver::run`
+   ループ内に`RaftRole::Learner => { self.node.apply_committed(); }`
+   という**受け皿となる分岐だけ**が既に存在していた——投票権を持たない
+   非同期複製先という**概念**は既にコードに現れていたが、(a)実際に
+   このロールへ遷移させる経路(CLIフラグ等)、(b)Leaderの複製先
+   ・quorum計算からの扱い分け、(c)別プロセスとして起動した際の
+   ネットワーク到達性、のいずれも配線されていなかった——「部品は
+   あったが繋がっていなかった」という、このエコシステムで過去に
+   繰り返し発見されてきたパターンの新たな実例。
+2. **CockroachDB Serverlessのephemeral SQL pod**: 前回HANDOFF
+   (直上)で参照した英語文献
+   ([Jack Vanlightly氏の解説](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1))
+   の内容を踏襲し、「テナントごとの使い捨て計算単位」という発想を、
+   Kubernetes pod単位のオーケストレーションではなく、`tokio::process::
+   Command`による**OSプロセスレベルの生成・終了**で単一マシン上でも
+   模擬できると判断した(詳細は段階2参照)。
+
+### 段階2: 実装した再設計の内容
+
+**(1) 真のRaft learner化(マルチプロセス化・実ネットワーク複製)**
+
+- `crates/aruaru-dist/src/raft/node.rs`: `RaftNode`に`learners: Vec<u64>`
+  (投票権を持たないpeer)・`self_is_learner: bool`(自ノードがlearnerと
+  して構築されたか)を追加。`RaftNode::new_with_learners(node_id,
+  applier, peers, learners, self_is_learner)`を新設(既存の`new`は
+  `learners=[]`・`self_is_learner=false`で委譲、完全後方互換)。
+  `replication_targets()`(voter+learner両方、複製送信対象)を追加。
+  **発見・修正した実バグ**: `append_entries`(Leaderからの受信処理)が
+  無条件に`s.role = RaftRole::Follower`へ遷移させていたため、
+  learnerとして構築したノードもLeaderからの最初のAppendEntries受信を
+  機にFollowerへ格上げされ、`driver.rs`のFollower/Candidate分岐
+  (選挙タイムアウトでCandidate昇格)に巻き込まれてしまう——投票権を
+  持たないはずのlearnerが実際には選挙に参加してしまう、という設計を
+  壊す実バグになるところだった。`self_is_learner`のときはLearnerロール
+  を維持するよう修正。
+- `maybe_commit`(quorum判定)は`self.peers`(voter)のみを見る既存実装を
+  そのまま維持——learnerを`replication_targets()`に含めても複製先が
+  増えるだけでcommitの安全性には影響しない設計にした。
+- `crates/aruaru-dist/src/raft/driver.rs`: `replicate()`が
+  `node.peers()`ではなく`node.replication_targets()`(voter+learner)へ
+  AppendEntriesを送るよう変更。
+- `crates/aruaru-server/src/cluster.rs`: `build_cluster_with_learners`
+  新設(既存`build_cluster`は後方互換の薄いラッパーへ)。
+- `crates/aruaru-server/src/main.rs`: 新CLIフラグ`--raft-role`
+  (`voter`/`learner`)・`--learner-peers`を追加。
+  例: `aruaru-server --raft-id 1 --raft-role voter --learner-peers
+  "2@127.0.0.1:6002"`(Leader側)、`aruaru-server --raft-id 2
+  --raft-role learner --peers "1@127.0.0.1:6001"`(learner側)を
+  **実際に2つの別プロセス**として起動できる。
+- テスト: `raft/node.rs`に
+  `test_learner_role_preserved_across_append_entries_and_applies_
+  committed_entries`(上記バグの回帰テスト)・
+  `test_leader_quorum_excludes_learners_but_still_replicates_to_them`
+  (learnerの複製がquorumに数えられないことの直接検証)を追加。
+
+**(2) ephemeral SQL pod化(プロセスレベルの使い捨て計算単位)**
+
+- `crates/aruaru-server/src/ephemeral_pod.rs`(新規)。親プロセスが
+  対象テナントのテーブルスナップショットをJSON化し、
+  `tokio::process::Command`で**自分自身の実行ファイル**を
+  `--ephemeral-worker`フラグ付きで子プロセスとして起動、標準入力で
+  リクエストを渡し、子プロセスは完全に独立したインメモリ
+  `QueryEngine`(永続ストレージ・Raft・pgwire・GraphQLは一切起動しない)
+  でテーブルを再現しSQLを1回実行、結果を標準出力へJSONで書いて
+  **即座に終了する**。`main.rs`に`--ephemeral-worker`内部フラグを追加し、
+  設定時はこのワーカーモードのみ実行して即returnする。
+  `crates/aruaru-server/src/admin.rs`に`POST /admin/ephemeral-query`
+  (`{tenant_id, tables: [テーブル名], sql}`)を新設、実際に子プロセスを
+  起動して結果を返す。
+- **正直な開示・スコープの限界**(`ephemeral_pod.rs`冒頭docコメントにも
+  記載): (a) cgroup/Job Object等によるCPU/メモリ/帯域の真のリソース
+  制限は実装していない——「独立したOSプロセスとして起動・終了する」
+  というプロセス分離そのものの実証に留まる。(b) 永続ストレージ(fjall)
+  には触れない設計(子プロセスが親と同じデータディレクトリを同時に
+  開くとファイルロック競合のリスクがあるため、意図的にJSON経由の
+  インメモリスナップショットのみを渡す)——書き込みは子プロセスの
+  メモリ上でのみ完結し親の永続状態には反映されない、読み取り専用の
+  テナント別計算オフロードに限定される。(c) 複数物理マシンをまたぐ
+  真のオーケストレーション(Kubernetes pod相当)はこの環境では検証
+  不可能。
+
+### 段階3: 実プロセス間での検証結果(実測、型チェックのみで終わらせない)
+
+**(1) Raft learner — 2プロセスでの実ネットワーク複製検証**:
+`aruaru-server.exe`を実際に2プロセス起動(leader: `--raft-id 1
+--raft-role voter --learner-peers "2@127.0.0.1:6002"` port 6001/6011、
+learner: `--raft-id 2 --raft-role learner --peers "1@127.0.0.1:6001"`
+port 6002/6012)、leaderへ`POST /admin/cluster/propose`で
+`CREATE TABLE items`+`INSERT`を実行後、learner側プロセスへ
+`POST /admin/federation/query`(`local.SELECT * FROM items`、
+learner自身のインメモリQueryEngineへの直接クエリ)で**実際に挿入した
+行(`id=1, name=sword`)が読めることを確認**——TCP経由の実HTTPリクエスト
+によるAppendEntries複製が、別プロセス・別ポートのlearnerへ実際に
+届いていることの直接証拠。
+
+検証の過程で**2件の実バグを発見・修正した**(いずれも「複数プロセスを
+実際に起動して検証する」という今回のアプローチが無ければ発見できな
+かったもの):
+1. `HttpTransport`(`raft/transport.rs`)がAppendEntries/RequestVote送信時
+   に`x-admin-token`ヘッダーを一切付与していなかった——2026-07-30に
+   `/admin/*`全体へ認証を遡及適用した際のHANDOFFが「これらを実際に
+   呼ぶノード間通信はまだ配線されていないため実害は無い」と正直に
+   記していた通りの、まさにその「実際に呼ばれた初回」で顕在化した。
+   環境変数`ARUARU_DB_ADMIN_TOKEN`を読み取り全リクエストへ付与する
+   よう修正。
+2. **さらに深刻な別バグ**: `HttpTransport`が`{base}/raft/append`
+   (`/admin`プレフィックス無し)へ送信していたが、`main.rs`は
+   `admin::admin_routes(..)`全体を`.nest("/admin", ..)`でマウントして
+   いるため受信側の実パスは`/admin/raft/append`——**送信先パスが
+   そもそも存在しない404**だった(1のトークン修正だけでは解決せず、
+   `--log-level debug`で実際のエラーログ
+   `"append_entries send failed", error: "HTTP status client error
+   (404 Not Found)"`を確認して発見)。両方を修正して初めて複製が
+   成功した。この2つのバグはいずれも`tracing::debug!`にしか記録
+   されないため通常運用(info以上のログレベル)では気づけない、
+   サイレントに複製が止まる実バグだった。
+
+**(2) ephemeral SQL pod — 実際の子プロセス生成・終了の検証**:
+親プロセス(`aruaru-server.exe`、port 6101)へ`CREATE TABLE gear`+
+2行`INSERT`後、`POST /admin/ephemeral-query`
+(`{tenant_id: "tenantA", tables: ["gear"], sql: "SELECT * FROM gear
+WHERE qty = '10'"}`)を実行し、**フィルタ条件に合う1行だけが正しく
+返る**ことを確認。同時に`Get-Process aruaru-server`のプロセス数を
+呼び出し前後で比較し、**子プロセスが実際に起動して応答後に終了して
+いる**(プロセス数が呼び出し前後で変化しない=常駐していない)ことを
+確認した。
+
+**実行した主要コマンド(すべて実行、生ログ・生JSON応答を確認)**:
+`cargo build -p aruaru-server`(3回、各修正後に再ビルド)、
+`cargo test --workspace`(全クレート、リグレッション無し確認)、
+自作PowerShellスクリプト2本(2プロセスRaft learner検証・ephemeral pod
+検証、いずれも一時データディレクトリで実行し検証後にプロセスを終了)。
+
+### 段階4: なお残る制約(正直な開示、誇張しない)
+
+1. **真の分散クラスタ(複数物理マシン)での検証は本環境では不可能**:
+   今回の検証は同一マシン上の複数プロセス・複数ポートに留まる
+   (`127.0.0.1`上の別ポート)。複数物理マシン・実ネットワーク越しの
+   レイテンシ・パーティション耐性は未検証。
+2. **openraft自体への統合は今回も行っていない**: `raft/mod.rs`が
+   計画として記す「本番のリーダー選挙・ハートビート・スナップショット・
+   ネットワークRPCをopenraftへ委譲する」は引き続き未着手——今回は
+   既存の自前実装Raft(`RaftNode`/`RaftDriver`/`HttpTransport`)の枠内で
+   learnerロールを実際に機能させた。
+3. **learnerの動的追加・削除(ConfChange)は無い**: 現状は起動時の
+   CLIフラグで役割・peer構成が固定される(TiKVの`AddLearner`/
+   `PromoteLearner`のような実行時のメンバーシップ変更は未実装)。
+4. **ephemeral SQL podは読み取り専用**: 子プロセスでの書き込みは
+   子プロセスのメモリ上でのみ完結し、親プロセスの永続状態(fjall)には
+   一切反映されない(意図的な制約、上記段階2参照)——真の
+   「テナントごとに独立した書き込み可能なephemeral計算単位」には
+   なっていない。
+5. **リソース制限は無い**: 子プロセスのCPU/メモリ/帯域をOSレベルで
+   制限する仕組み(cgroup、Windows Job Object)は実装していない。
+6. **learner対応のRequestVote拒否は明示していない**: `request_vote`
+   自体はlearnerでも技術的には呼べてしまう(driver.rs側がlearnerを
+   選挙に参加させない設計のため実害は無いが、`RaftNode::request_vote`
+   単体に「learnerは投票応答しない」という明示ガードは追加していない
+   ——次回、防御的に追加する余地がある)。
+
+### 次にすべきこと(次回候補)
+
+(1) `RaftNode::request_vote`にlearner向けの明示ガードを追加する
+(現状は`driver.rs`側の分岐だけに依存)、(2) learnerの動的追加・削除
+(ConfChange相当)、(3) ephemeral SQL podに書き込みの永続反映
+(fjallのファイルロック競合を避けるための設計、例えば書き込み結果を
+親プロセスへ返しRaft経由でコミットする、等)を持たせる、(4) 実際に
+openraftクレートへ統合する場合の移行計画の具体化。
+
+## HANDOFF: 2026-08-21(続き) 分散DBの新技術4種を6言語で調査、FoundationDB型
+決定的シミュレーションテスト(DST)を実装レベルで統合
+
+前回HANDOFF(真のRaft learner化+ephemeral SQL pod化)で「AppendEntriesが
+認証ヘッダ無し・誤ったパスで送られ複製がサイレントに失敗する」という実バグ
+2件が`tracing::debug!`にしか出ず、実プロセスを2つ起動して初めて発見できた
+という経緯を踏まえ、「複数プロセスを実際に起動する」以外の方法でこの種の
+バグ(特にRaftのログ複製ロジック自体に潜む競合状態)を機械的・網羅的に
+検出する手段を調査した。
+
+### 調査した4技術(実際にWebSearchツールを日本語含む6言語で呼び出し、
+実在するURLを確認済み)
+
+1. **FoundationDBの決定的シミュレーションテスト(DST)** — 採用・実装済み(詳細下記)。
+   - 英語(一次情報): https://www.foundationdb.org/files/fdb-paper.pdf 、
+     https://apple.github.io/foundationdb/testing.html 、
+     https://antithesis.com/docs/resources/deterministic_simulation_testing/ 、
+     https://www.amplifypartners.com/blog-posts/a-dst-primer-for-unit-test-maxxers 、
+     https://www.polarsignals.com/blog/posts/2024/05/28/mostly-dst-in-go 、
+     FOSDEM 2026「Random seeds and state machines: An approach to deterministic
+     simulation testing in Rust」https://fosdem.org/2026/schedule/event/GNTZDT-rust-deterministic-simulation-testing/
+     (Rustでの実装事例——本実装の設計判断の参考にした)
+   - フランス語: https://pierrezemb.fr/posts/diving-into-foundationdb-simulation/ 、
+     https://pierrezemb.fr/posts/learn-about-dst/
+   - 中国語: https://zhuanlan.zhihu.com/p/375321579 、
+     https://developer.aliyun.com/article/789474
+   - 韓国語: https://moonsub-kim.github.io/docs/distributed-systems/foundationdb/
+   - GitHub実在確認: https://github.com/apple/foundationdb (Apple公式、
+     Flow言語〈C++拡張〉によるDSTフレームワーク`flow/sim2`が実装として存在。
+     "一晩に数万回のシミュレーション、延べ約1兆CPU時間相当"という規模の
+     記述も一次資料〈上記論文・testing.html〉で確認)。
+   - **aruaru-dbへの適合度**: 高い。`RaftNode`(`raft/node.rs`)の
+     `propose`/`append_entries`/`request_vote`/`maybe_commit`は元々
+     同期的な純粋関数に近い設計(HTTPトランスポートやtokioランタイムに
+     依存しない)であり、これは意図してそう設計されたものではなかったが、
+     結果としてFoundationDB本家のように「本番コードをシミュレータに
+     差し替える」大改造無しに、既存のAPIをそのまま単一スレッドの決定的
+     イベントループから直接呼び出すだけでDSTが書けた。
+
+2. **ScyllaDB / Seastarのshard-per-core(shared-nothingアーキテクチャ)** —
+   見送り(下記理由)。
+   - 英語: https://www.scylladb.com/product/technology/shard-per-core-architecture/ 、
+     https://seastar.io/shared-nothing/ 、
+     https://www.scylladb.com/2024/10/21/why-scylladbs-shard-per-core-architecture-matters/
+   - GitHub実在確認: https://github.com/scylladb/scylladb (C++実装、
+     Apache Cassandra/DynamoDB互換、実運用実績あり)。155リポジトリを
+     公開する組織アカウントも確認 (https://github.com/orgs/scylladb/repositories)。
+   - **見送り理由**: CPUコアごとに独立したシャード(専用メモリ・専用I/O
+     キュー、コア間はメッセージパッシングのみ)という設計思想は魅力的だが、
+     aruaru-dbは既にRangeごとに独立したRaftグループ+CockroachDB型
+     キー空間分離(前々回HANDOFF実装済み)でシャーディングの基本形は
+     持っている。Seastar型のOS Thread per Core最適化を本気で取り込むには
+     `tokio`ランタイム全体をSeastarのような専用イベントループへ置き換える
+     規模の書き換えが必要で、既存の`tokio::main`+`parking_lot`前提の
+     コードベース(Cargo.toml参照)全体への影響が大きすぎる。費用対効果が
+     見合わないため見送り、記録だけ残す。
+
+3. **Vitess/PlanetScaleのVSchemaベース水平シャーディング** — 見送り。
+   - 中国語: 検索クエリ「Vitess PlanetScale 分片架构 vshard 原理」で
+     中国語一次資料は得られず、英語資料 https://planetscale.com/docs/vitess/sharding 、
+     https://planetscale.com/learn/courses/vitess/horizontal-sharding
+     に帰着(検索言語を変えても情報源自体は英語という実態を正直に記録)。
+   - **見送り理由**: VitessはMySQLプロトコル互換層の手前にVTGateという
+     クエリルーティング層を置く設計で、「既存のMySQLクラスタ群をシャーディング
+     する」ユースケースに最適化されている。aruaru-dbは自前のRaft+QueryEngineを
+     持つため、VTGate相当の機能は既にCockroachDB型キー空間分離で代替済みで
+     あり、Vitessの設計をそのまま輸入する新規性・必要性が薄いと判断。
+
+4. **DuckDBの組み込み型ベクトル化OLAPエンジン** — 見送り(ただし将来候補として記録)。
+   - ドイツ語: https://duckdb.org/why_duckdb 、
+     https://motherduck.com/duckdb-book-summary-chapter1/ の内容をドイツ語検索
+     経由で確認(MonetDB/X100由来のベクトル化実行エンジン、列指向、
+     プロセス内実行〈in-process〉)。
+   - GitHub実在確認: DuckDBは公知の広く使われるOSS(スター数十万規模、
+     ここでは個別に再確認まではしていない——正直な簡略化点)。
+   - **見送り理由**: aruaru-dbは既にTiFlash型プッシュ型購読による別系統の
+     OLAPキャッシュ(`aruaru-query::olap`、前々回HANDOFF実装済み・
+     `olap_cache_incremental_merge_handles_update_delete_and_insert_correctly`
+     等のテストで担保)を持っており、DuckDB本体への依存を追加するより
+     既存のインクリメンタルマージ機構を伸ばす方が一貫性が高い。DuckDBの
+     ベクトル化実行そのもの(SIMDバッチ処理によるCPUキャッシュ効率化)は
+     `aruaru-query::olap`の内部実装を高速化する際の参考として次回以降に
+     再検討する価値はあるため、完全な却下ではなく保留として記録する。
+
+### 実装した内容: `crates/aruaru-dist/src/raft/sim.rs`(新規、約340行)
+
+- `RaftNode`の`append_entries`/`request_vote`/`propose`/`maybe_commit`を
+  直接呼び出し、外部依存クレート無しの自前xorshift64乱数(`SimRng`、
+  シード値のみで完全再現可能)で駆動する単一スレッドの決定的イベントループ
+  (`run_simulation`)を実装。
+- フォールト注入(`FaultConfig`): メッセージ欠落(`drop_rate`)・重複配送
+  (`duplicate_rate`)・遅延による順序入替(`max_delay_ticks`、`BinaryHeap`
+  優先度キューで表現)。
+- 安全性検証: commit済み範囲でLeaderとFollowerの`(index, term)`が完全一致するか
+  (Log Matching Property)を検証。違反時は再現用のseed値をpanicメッセージに含める。
+  そのために`RaftNode`へ`term_at_index`(`ReplicatedLog::term_at`への薄い委譲)を
+  1メソッド追加(`crates/aruaru-dist/src/raft/node.rs`)。
+- テスト4件、うち中核は`test_sim_chaotic_many_seeds_never_violates_log_matching`
+  (drop_rate=0.2・duplicate_rate=0.1・max_delay_ticks=8で**200シード**を反復実行)
+  と`test_sim_extreme_drop_rate_still_safe`(drop_rate=0.9という極端値で50シード)。
+
+### 実装時に遭遇した実バグ1件(このシミュレーション自体が最初の実効果)
+
+初版では`leader_commit`をコマンド提案時点(Leaderの`commit_index`がまだ0の
+瞬間)にAppendEntriesへ埋め込んで一度きり送っていたため、
+`test_sim_no_faults_converges`(フォールト無しの基準シナリオ)が
+`commit_indices: [20, 0, 0, 0]`(Leaderだけ20、Follower全員0)で失敗した。
+実際のRaftでは`leader_commit`は複製完了後の**次のハートビート**に乗って
+初めてFollowerへ伝わる——この伝播ステップが実装から抜けていたことを、
+まさにこのシミュレーションテストが1回目の実行で検出した。修正として、
+複製フェーズの後に5ラウンドのハートビート段階(空エントリ+更新済み
+`leader_commit`をフォールト注入つきで再送)を追加。DSTを書く過程で
+DST自体が想定通りバグを検出したことになる。
+
+### 正直な簡略化点(誇張しない)
+
+1. **対象はRaftNodeの状態遷移ロジックのみ**。実際の`HttpTransport`・
+   実プロセス起動・tokioランタイムは一切介さない——前回HANDOFFで見つかった
+   「認証ヘッダ無し」「パス誤り」のようなトランスポート層のバグはこの
+   シミュレーションでは検出できない(役割分担が異なる、上記sim.rsの
+   モジュールコメントにも明記)。
+2. **リーダー選挙は対象外**。単一の固定Leaderで開始し、`RaftDriver`の
+   選挙タイムアウト・Candidate昇格ロジックは検証していない。
+3. **フォールトはメッセージレベルのみ**。ディスク故障・プロセスクラッシュ・
+   クロックスキューの注入は無い(FoundationDB本家のBUGGIFYはこれらも含む)。
+4. **反復シード数は200/50に留めている**(FoundationDB本家の「一晩数万回」
+   規模ではなく、CI実行時間を考慮した現実的な回数)。
+5. learner関連の安全性はこのシミュレーションの対象外(既存の
+   `node.rs`単体テストで別途担保)。
+
+### 動作確認(実際に実行、結果を記録)
+
+- `cargo build -p aruaru-dist --tests`: 成功。
+- `cargo test -p aruaru-dist raft::sim`: 4件中1件が初回失敗
+  (上記の`leader_commit`伝播バグ)→ 修正後、`test result: ok. 4 passed;
+  0 failed`。
+- `cargo test -p aruaru-dist`: `test result: ok. 36 passed; 0 failed;
+  1 ignored`(既存35件+新規4件-重複分、リグレッション無し)。
+- `cargo test --workspace`: 全クレートで`test result: ok`、失敗0件
+  (既存テストへの影響無しを確認)。
+- 実プロセスを起動した検証(前回HANDOFFのような複数プロセス起動)は
+  **今回は行っていない**——本タスクの主眼が「実プロセス起動無しで
+  同種のバグを検出する仕組み」の追加自体だったため、cargo
+  build/testでの確認に留めた。git commitは段階的に行い、pushはしていない
+  (ユーザーの明示的許可待ち)。
+
+### 次にすべきこと(次回候補)
+
+(1) フォールト種別へプロセスクラッシュ・再起動(learnerが再参加する
+シナリオ)を追加、(2) リーダー選挙自体をシミュレーション対象に含める
+(現状は固定Leaderのみ)、(3) 実行時間に余裕があるCI環境では反復シード数を
+数千程度まで引き上げる、(4) DuckDBのベクトル化実行を`aruaru-query::olap`
+の内部実装高速化の参考にする(見送りではなく保留、上記2-4節参照)。
+
+## HANDOFF: 2026-08-21(続き2) 前回の見送り判断(ScyllaDB/Vitess/DuckDB)を
+再検証、コストを理由にせず2件を実装レベルで統合
+
+**経緯**: 直上のHANDOFF(同日)がScyllaDB shard-per-core・Vitessシャーディング・
+DuckDB組み込みOLAPの3技術を「実装コストが高い」「既存機能と重複する」として
+見送っていたことに対し、ユーザーから「本当にそこまで調査したのか」「本当に
+完全に重複しているのか」「多少時間がかかる程度なら開発してほしい」という
+強い指摘を受けた。実装コストの高さのみを理由にした見送りは行わず、実際に
+ソースコードを再読・追加調査した上で、部分的にでも良いとこ取りできる要素を
+洗い出し、2件(ScyllaDB・Vitess)は実装レベルで統合した。DuckDBのみ、コストで
+はなくアーキテクチャ上の具体的な重複を示して見送りとした。
+
+### 1. ScyllaDB shard-per-core — 「全体書き換えが必要」という前回理由は
+過大なスコープの誤り、核心思想のみを部分適用して実装
+
+前回理由(「tokioランタイム全体をSeastar型イベントループへ置き換える規模」)
+を検証した結果、**この理由は「ScyllaDB全体の移植」という過大なスコープを
+前提にしており、「shared-nothingの核心(データのコア単位分割+ロックレスな
+メッセージパッシング通信)だけを切り出して部分適用する」という選択肢を
+検討していなかった**と判明した。
+
+`crates/aruaru-query/src/sharded_store.rs`(新規)に`ShardedRowStore<V>`を
+実装: `shard_count`個の専用OSスレッドがそれぞれ独立した`HashMap`を排他的に
+所有し(呼び出し元スレッドから直接アクセスする手段が構造的に存在しない)、
+通信は`std::sync::mpsc`によるメッセージパッシングのみ(`RwLock`/`Mutex`で
+データそのものを共有する既存`QueryEngine::tables`とは対照的)。キーから
+シャードへの割り当ては`SHA-256(key) % shard_count`(ScyllaDBのtoken-aware
+routingの簡略版、既存の`aruaru-core`ZFS互換チェックサムと同じSHA-256を
+再利用)。テスト6件で(a)キーの決定的ルーティング、(b)実際の複数シャードへの
+分散、(c)複数スレッドからの並行書き込みがロック無しで安全に成立すること
+を直接検証。
+
+**正直な開示**: (1) CPUピニング・専用I/Oスケジューラ(Seastarの核心である
+「1コアに1スレッドを物理的に固定」)は実装していない——OSデフォルトの
+スケジューラに委ねる。(2) `QueryEngine`の本番書き込み経路
+(`parking_lot::RwLock<HashMap>`)は今回置き換えていない——Raft・Prolly Tree・
+OLAPキャッシュがテーブル単位の単一HashMapを前提に設計されているため、
+全面移行は影響範囲が広く今回のスコープ外(独立コンポーネントとして追加、
+既存の`snapshot_pairing`/`raid_z_backend`と同じ段階的アプローチ)。
+
+### 2. Vitess/PlanetScaleシャーディング — 「VTGate相当は既に代替済み」
+という前回理由は不正確、実際には無い要素(Range併合・scatter-gather)が
+あったため実装
+
+前回理由を検証するため`crates/aruaru-dist/src/shard/topology.rs`・
+`multi_raft.rs`を再読した結果、**「既に代替済み」という前回の評価は
+不正確だった**——`ClusterTopology`は`split_range`(Range分割)は実装済み
+だったが、Vitessの[Reshard](https://vitess.io/docs/reference/vreplication/reshard/)
+が持つ双方向操作のうち**併合(複数シャードを1つへ戻す)は一件も実装されて
+いなかった**。また、CockroachDB型のポイントルーティング(`propose`、キーが
+分かっている場合)はあったが、Vitess VTGateの核心機能である
+**scatter-gather(シャーディングキー不明なクエリを全シャードへ展開し結果を
+集約する)も未実装**だった。この2点を実装した:
+
+- `ClusterTopology::merge_ranges(range_a, range_b)`(`shard/topology.rs`):
+  隣接する2つのRangeを1つへ統合(隣接性チェック付き、飛び地の統合は拒否)。
+  レプリカ集合は和集合、`range_id`は小さい方を引き継ぐ。テスト3件
+  (併合が分割を正しく逆転させる、非隣接Range併合の拒否、存在しないRangeの
+  安全な処理)。
+- `MultiRaftCluster::merge`(`multi_raft.rs`): トポロジ統合に加え、消えた
+  側のRaftグループを`groups`から除去。
+- `MultiRaftCluster::scatter_gather<T, F>`(`multi_raft.rs`): 全Range
+  (全Raftグループ)へ同じ読み取りクロージャを適用し、range_id順に結果を
+  集約する——VTGateの「シャーディングキー不明なクエリを全シャードへ展開し
+  マージする」と同じ形。テスト2件(併合後のキー空間再統合、3Rangeからの
+  scatter-gather集約)。
+
+**正直な開示**: (1) `merge`はトポロジ構造の統合(キー空間ルーティングが
+1本化されること)のみを扱い、消えた側のRaftグループが保持していたログ・
+状態機械の内容を統合先へマージする処理は行わない(`split`が新グループを
+空ログから始める簡略化と対になる簡略化)。(2) `scatter_gather`は読み取り
+専用の集約であり、書き込み(合意を伴う`propose`)はこの関数の対象外。
+(3) `aruaru-server`の実運用経路(pgwire/GraphQL/REST admin API)からの
+呼び出し配線は今回未実施——`multi_raft`モジュール自体が既存HANDOFFの
+時点で「疎結合コンポーネントとして実装、呼び出し元への配線は次段階」と
+されており、今回もその段階に留まる。
+
+### 3. DuckDB組み込みOLAPエンジン — 見送りを維持するが、理由を「コスト」
+から「アーキテクチャ上の具体的重複」へ差し替え
+
+前回の見送り理由(「既存のTiFlash型OLAPキャッシュと重複」)は正しい方向
+だったが根拠が薄かったため、`crates/aruaru-query/src/olap.rs`を実際に
+読み直し、具体的な重複箇所を特定した:
+
+- DuckDBの性能の核心は[MonetDB/X100由来のベクトル化実行エンジン]
+  (列指向データをバッチ〈ベクトル〉単位でCPUキャッシュ効率よく処理する)
+  にある。
+- `aruaru-query/src/olap.rs`は**既にApache DataFusionを使っており、
+  DataFusion自体がArrow(列指向メモリフォーマット)ベースの同系統の
+  ベクトル化実行エンジン**である——`build_table_batch`が`Int64Array`/
+  `Float64Array`等のArrow列配列を構築し(28〜73行目)、
+  `rebuild_incremental`が`arrow::compute::filter_record_batch`という
+  列指向の軽量フィルタカーネル(文字列パース不要のバッチ処理、
+  240〜248行目)を使い、`session_context`が`target_partitions`で
+  マルチコア並列実行を構成する(75〜82行目)——これらはDuckDBが
+  MonetDB/X100から受け継ぐ設計そのもの(列指向・バッチ処理・
+  SIMDフレンドリー)と**同一系統**である。
+- したがって見送り理由は「実装コストが高い」ではなく、**「DuckDBを
+  追加導入しても、既存のDataFusion統合が既に提供している性能特性
+  (ベクトル化列指向実行)と機能的に重複するAPI・実行エンジンをもう1つ
+  抱えることになるだけで、新規の実行方式上の能力を追加しない」**という、
+  コードで裏付けられた具体的なアーキテクチャ上の理由に差し替える。
+  (DuckDBの「組み込み・依存ゼロで動く」という別の強みはあるが、
+  `aruaru-server`は既にDataFusionを組み込み依存として持つプロセス
+  内蔵型サーバーであり、この強みも新規性を生まない。)
+
+### 検証結果(実測)
+
+- `cargo test -p aruaru-dist multi_raft` → 5 passed / 0 failed
+  (新規`merge_reunifies_ranges_and_removes_the_absorbed_raft_group`・
+  `scatter_gather_collects_a_reading_from_every_range_like_vitess_vtgate`
+  含む)。
+- `cargo test -p aruaru-dist shard` → 9 passed / 0 failed(新規
+  `test_merge_reverses_split_like_vitess_reshard`・
+  `test_merge_rejects_non_adjacent_ranges`・
+  `test_merge_unknown_range_returns_none`含む)。
+- `cargo test -p aruaru-query sharded_store` → 6 passed / 0 failed。
+- `cargo build --workspace` → 成功(既存の`build_cluster`/`propose_commit`
+  未使用警告2件のみ、いずれも今回の変更と無関係な既知の警告)。
+- `cargo test --workspace` → 全19クレート/テストバイナリで
+  `test result: ok`、失敗0件(既存テストへの回帰無し)。
+
+### 正直な開示・今回も残る未着手事項
+
+(1) `ShardedRowStore`・`merge`/`scatter_gather`とも`aruaru-server`の
+実運用経路への配線は未実施(独立コンポーネントとしての実装段階)、
+(2) ScyllaDBのCPUピニング・Vitessのログマージを伴う真の併合は見送り
+(上記の各節参照、理由はコストではなく「単一プロセス前提の現行実装が
+ネットワーク越し複製・OSレベルCPU制御の前提を持たない」という構造的
+制約)、(3) DuckDBは今回もコード追加なし(見送り理由をアーキテクチャ上の
+重複へ差し替えたのみ)。
+
+### 次にすべきこと(次回候補)
+
+(1) `ShardedRowStore`を`aruaru-server`の実際のテーブルストレージ経路へ
+段階的に配線する場合の設計(Raft/Prolly Tree/OLAPキャッシュとの整合性を
+どう保つか)、(2) `MultiRaftCluster::merge`にログ内容のマージ(消える側の
+未適用エントリを統合先へ引き継ぐ)を追加する場合の設計、(3)
+`scatter_gather`を実際のクロスシャードSQL(`aruaru-query::QueryEngine`)
+から呼び出せるようにする配線。
+
+## HANDOFF: 2026-08-21(続き3) ScyllaDB `ShardedRowStore`とVitess
+`merge`/`scatter_gather`を`aruaru-server`本体の運用経路へ実配線、
+実プロセスでHTTP動作確認
+
+**経緯**: 直上のHANDOFF(同日)が両者とも「独立コンポーネントとしての実装
+段階」に留めていたことに対し、ユーザーから「実際にaruaru-server本体の
+運用経路へ配線し、実プロセスを起動してHTTP経由で動作確認せよ」との指示。
+既存機能(pgwire/GraphQL/REST経由のOLTP書き込み経路)を壊さないことを
+優先し、両者とも**オプトインの独立エンドポイント**として`/admin/*`配下に
+追加する方式を選んだ(置き換えではなく追加)。
+
+### 1. ScyllaDB `ShardedRowStore` の配線
+
+`crates/aruaru-server/src/admin.rs`の`AdminState`に
+`sharded_store: aruaru_query::sharded_store::ShardedRowStore<String>`
+フィールドを追加(`AdminState::new`で`ShardedRowStore::new(0)`により
+論理コア数ぶんのシャードスレッドを起動)。新規エンドポイント3つ:
+`POST /admin/sharded-store`(put)・`GET /admin/sharded-store/:key`
+(get)・`GET /admin/sharded-store-stats`(シャードごとのエントリ数)。
+ハンドラは`tokio::task::spawn_blocking`で`std::sync::mpsc`の
+ブロッキング`recv()`をtokioワーカースレッドから退避している(シャード
+スレッドとの通信がブロッキングI/Oである設計上の性質を、非同期HTTP
+ハンドラ側で正しく扱うための配慮)。
+
+**既存ストレージ(`QueryEngine::tables`)を置き換えるか追加するかの判断**:
+置き換えは選ばなかった——Raft・Prolly Tree・OLAPキャッシュ全てが
+テーブル単位の単一`HashMap`を前提に設計されており、影響範囲が広い
+(前回HANDOFFで既に正直に開示済みの制約)。オプトインの独立ストレージ
+(`/admin/sharded-store`)として追加する方式が「既存機能を壊さない」
+というユーザー指示に最も合致すると判断した。
+
+### 2. Vitess `merge`/`scatter_gather` の配線
+
+`AdminState`に`multi_raft: Mutex<Option<Arc<MultiRaftCluster
+<EngineApplier>>>>`を追加。`main.rs`起動時、既存の単一`ClusterNode`
+(本番のOLTP書き込み経路)とは別に、`MultiRaftCluster::single_node`で
+単一ノード構成のMulti-Raftクラスタを初期化し`admin_state.attach_
+multi_raft(..)`で取り付ける。新規エンドポイント3つ:
+`POST /admin/multi-raft/split`(Range分割)・`POST /admin/multi-raft/merge`
+(Vitess Reshard併合)・`GET /admin/multi-raft/scatter-query`
+(VTGate scatter-gather、全Rangeのcommit_index+roleをrange_id順に集約)。
+`aruaru_dist::lib.rs`に`MultiRaftCluster`のトップレベル再エクスポートを
+追加(従来`multi_raft`モジュール内のみで、クレート外から`aruaru_dist::
+MultiRaftCluster`として参照できなかった)。
+
+### 3. 実プロセスでのHTTP動作確認(実測、型チェック・ビルド成功では終わらせない)
+
+実際に`aruaru-server.exe`(`cargo build -p aruaru-server`で生成した
+実バイナリ)を`--raft-id 1 --gql-port 7301`で起動し、
+`ARUARU_DB_ADMIN_TOKEN`を設定した上で以下を全て実HTTPリクエストで確認:
+
+1. `GET /healthz` → `ok`(起動確認)。
+2. `POST /admin/sharded-store`を3回(`alpha`/`beta`/`gamma`)実行 →
+   それぞれ`shard_id`が30/9/0という異なるシャードへ実際に振り分けられた
+   ことを確認(SHA-256ベースのtoken-aware routingが実際に機能している
+   直接証拠)。
+3. `GET /admin/sharded-store/alpha`・`/beta` → 書き込んだ値
+   (`apple`/`banana`)が正しく読み戻せることを確認。
+4. `GET /admin/sharded-store-stats` → `shard_count: 32`
+   (このマシンの論理コア数)、`per_shard_len`の該当インデックスのみ`1`、
+   `total_len: 3`——分散状況を実際に観測できることを確認。
+5. `POST /admin/multi-raft/split`を2回(range 1を`m`で分割→range 2、
+   range 2を`t`で分割→range 3)実行 → `range_count`が1→2→3と実際に
+   増加することを確認。
+6. `GET /admin/multi-raft/scatter-query`(分割直後) → 3つの独立した
+   Rangeそれぞれの`commit_index`/`role`が実際に返ることを確認
+   (`range_id: 1,2,3`全て`Leader`・`commit_index: 0`)。
+7. `POST /admin/multi-raft/merge`(range 1と2を併合) →
+   `merged_range_id: 1`・`range_count: 2`を確認。
+8. `GET /admin/multi-raft/scatter-query`(併合後) → range 1と3の
+   **2件**のみが返り、統合が実際にscatter-gatherの結果へ反映される
+   ことを確認。
+9. 存在しないrange_idでの併合(`range_a:1, range_b:999`) →
+   `success: false`で安全にエラーメッセージが返ることを確認
+   (パニックしない)。
+10. `x-admin-token`ヘッダー無しで`GET /admin/multi-raft/scatter-query`
+    を呼ぶ → **401**(既存の全`/admin/*`共通認証ミドルウェアが新規
+    エンドポイントにも自動的に適用されていることを確認——`admin_routes()`
+    の`.around()`ラッパー内にルートを追加しただけで個別の認証実装は
+    不要だった)。
+
+検証後、起動していたプロセスを`Stop-Process`で終了し、標準エラー
+ログ(`err.log`)にエラー・パニックが一切無いことを確認した上で
+一時検証用データディレクトリを削除した(リポジトリへの影響なし)。
+
+### 検証結果(実測、コマンド・出力込み)
+
+- `cargo build -p aruaru-server` → 成功(既存の`build_cluster`/
+  `propose_commit`未使用警告2件のみ、いずれも今回の変更と無関係)。
+- `cargo test -p aruaru-server -p aruaru-dist -p aruaru-query` →
+  全green(aruaru-dist 41 passed/1 ignored、aruaru-query 52 passed、
+  aruaru-server 3 passed/1 ignored)、リグレッション無し。
+- `cargo build --workspace` → 成功。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件。
+- 上記の実HTTP検証10項目すべて実施・成功。
+
+### 配線中に見つけた不整合・バグ
+
+**無し**。実装・実HTTP検証を通じて新規のバグは発見しなかった
+(既存のRaftNode/MultiRaftCluster/ShardedRowStoreのロジック自体は
+前回HANDOFFで既にテスト済みだったため、今回は「配線」作業が主体)。
+
+### 正直な開示・残る制約
+
+1. **`ShardedRowStore`は依然として独立ストレージ**——`QueryEngine`の
+   本番テーブルデータとは無関係(キー・値ともに任意の文字列を保持する
+   汎用KVとしての公開に留まる)。テーブルデータそのものをシャード分割
+   したいという要求には、Raft/Prolly Tree/OLAPキャッシュ全体の再設計が
+   必要で、今回もそこには踏み込んでいない。
+2. **`MultiRaftCluster`は`ClusterTopology`の構造操作+読み取り集約のみ
+   を実配線した**——`multi-raft/split`/`multi-raft/merge`は実際に
+   独立したRaftグループの生成・除去を行うが、これらのRangeへの実際の
+   書き込み(`propose`)・複数物理ノードへのネットワーク複製は今回の
+   配線対象外(既存の`propose_write`/pgwire経路は引き続き単一の
+   `ClusterNode`を使う——2つのRaft関連コンポーネントが並行して存在する
+   状態のまま)。
+3. **`ShardedRowStore`・`MultiRaftCluster`とも認証(`x-admin-token`)は
+   `/admin/*`共通ミドルウェア経由で自動的に適用されるが、複数ノード
+   クラスタでの`multi-raft/*`操作の整合性(全ノードでトポロジが同期
+   されるか)は単一ノード構成でしか検証していない**。
+
+### 次にすべきこと(次回候補)
+
+(1) `MultiRaftCluster`のRangeへ実際に書き込み(`propose`)できる
+管理APIエンドポイントの追加、(2) `ShardedRowStore`をテナント別
+キャッシュ層など、既存のOLTP経路と衝突しない具体的な用途へ本格接続する、
+(3) 複数ノード構成での`multi-raft/*`操作の実地検証。
+
+## HANDOFF: 2026-08-21(続き4) DuckDB見送り判断の深掘り再調査(8言語)+
+「埋もれた技術」探索、辞書エンコーディング+ゾーンマップを実装
+
+**経緯**: 直上のHANDOFF(同日)がDuckDBの見送り理由を「aruaru-query::olap
+が既にDataFusion(同系統のベクトル化列指向エンジン)を統合済み」とした
+ことに対し、ユーザーから「本当に十分な調査か、世界中の言語で調査をやり
+直し、埋もれた最先端技術を見逃していないか」との指示。日英に加え中・独・
+仏・韓・西・露の**8言語**で実際にWebSearchを複数回実行し、DuckDBと
+DataFusionの詳細な設計差分・他の埋もれた技術を再調査した。
+
+### 調査結果(言語ごと、出典付き)
+
+- **英語**: DuckDBのストレージ層固有技術として、(1) **ゾーンマップ
+  (min/maxブロック統計によるRow Groupスキップ)**、(2) **辞書エンコー
+  ディング**(重複文字列を辞書へ集約)、(3) 定数エンコード・RLE・
+  ビットパッキング・FSST・Chimp/Patasを含む**型認識軽量圧縮**、(4)
+  ハッシュ結合・GROUP BY・ソート・ウィンドウ関数全てに対応した
+  **out-of-coreスピル**(バッファマネージャが全メモリを統括管理)、
+  を確認
+  ([Lightweight Compression in DuckDB](https://duckdb.org/2022/10/28/lightweight-compression)、
+  [DuckDB in Depth](https://endjin.com/blog/duckdb-in-depth-how-it-works-what-makes-it-fast)、
+  [TaDa-04 slides](https://blobs.duckdb.org/slides/TaDa-04.pdf)、
+  [Memory Management in DuckDB](https://duckdb.org/2024/07/09/memory-management)、
+  [Storage dictionary compression PR #3109](https://github.com/duckdb/duckdb/pull/3109))。
+  **これらは前回HANDOFFが見落としていた、DataFusionのベクトル化実行
+  エンジンとは別軸のDuckDB固有技術要素**——前回の「同系統のエンジンだから
+  重複」という判断は、実行モデル(ベクトル化)は同系統でも、**ストレージ
+  フォーマット固有の最適化(ゾーンマップ・辞書エンコード)は別軸**であり
+  aruaru-query側に実装が無かった、という点を見落としていたことが判明した。
+- **中国語(簡体字)**: PolarDBの新ベクトル化実行エンジンがコア演算子性能
+  40〜400%向上、ソートスループット23倍という2026年の実例、Apache Doris
+  4.1.0のIVF/IVF_ON_DISKベクトルインデックス(INT8/INT4/PQ量子化)による
+  ベクトル検索性能4倍向上等を確認したが、これらはベクトル検索・大規模
+  実行エンジン最適化であり、aruaru-dbの現在の規模には過大
+  ([半年度盤点2026上半年版](https://zhuanlan.zhihu.com/p/2063922209849193484))。
+- **ロシア語**: Tantor Labsの「Tantor XData」がHTAP(トランザクション+
+  分析同時処理)の第3世代DBマシンとして発表されたことを確認、Tarantool
+  Column Store(TCS)がB-tree(OLTP)+ビットマップインデックス(OLAP)の
+  ハイブリッドインデックスでHTAPを実現していることも確認したが、
+  いずれもaruaru-dbが既に持つHTAP路線(Multi-Raft+OlapCache)と同方向で
+  新規性は薄い
+  ([TAdviser 2026レビュー](https://www.tadviser.ru/index.php)、
+  [Tarantool HTAP解説](https://tarantool.io/blog/kak-primenyat-arhitekturu-htap-v-biznese-i-real-time-analitike/))。
+- **ドイツ語**: ゾーンマップ自体のドイツ語一次資料は見当たらず(検索結果は
+  一般的な列指向DB解説のみ)、ビットマップインデックス+ソートの組み合わせ
+  でRLE圧縮率が桁違いに向上するという一般論を確認
+  ([spaltenorientierte Datenbank解説](https://de.wikipedia.org/wiki/Spaltenorientierte_Datenbank))。
+- **フランス語**: DuckDBが列ごとにセグメント化してメモリ格納し、必要な
+  列・行のみ読むことで計算高速化・メモリ削減を実現するという一般的な
+  アーキテクチャ解説を確認したが、ゾーンマップ/辞書エンコードそのものに
+  言及する独自のフランス語資料は見当たらなかった(正直な開示)
+  ([next-decision.fr DuckDB解説](https://www.next-decision.fr/wiki/creation-dun-data-lakehouse-avec-duckdb-et-dbt))。
+- **韓国語**: 列指向格納がキャッシュ効率・圧縮率を高めるという一般論
+  ([IvoryRabbit DuckDBブログ](https://ivoryrabbit.github.io/posts/DuckDB/))
+  を確認したが、「ゾーンマップ」「辞書エンコーディング」という具体的な
+  用語に言及する韓国語資料は見当たらなかった(正直な開示)。
+- **スペイン語**: 「compresión adaptativa」「índice zonal」という
+  クエリでは、ベクトルDB(Pinecone/ChromaDB/Weaviate等)の2026年ランキング
+  記事が中心に返り、目的の技術(ゾーンマップ)に特化したスペイン語資料は
+  見当たらなかった(正直な開示、検索結果からベクトルDBという別分野の
+  情報が優勢だったことを記録)。
+
+**「埋もれた最先端技術」の探索結果**: 8言語での再調査を通じて、DuckDB以外
+に**aruaru-dbへ新規に取り込む価値のある、実在し実装確認できる技術**は
+見つからなかった(PolarDBの新ベクトル化エンジン・Apache Dorisのベクトル
+検索量子化は実在するが、いずれも本リポジトリの現在の規模・用途からは
+過大、または既存のOLTP中心設計と方向性が異なると判断)。**唯一の実質的な
+発見は、DuckDB自体の中でも「ベクトル化実行」ではなく「ストレージ層固有の
+最適化(ゾーンマップ・辞書エンコード)」という、前回見落としていた別軸の
+技術要素だった。**
+
+### 判断: DuckDB本体の見送りは維持するが、ストレージ層固有技術2点は
+コストを理由にせず実装
+
+DuckDB本体(独立した実行エンジン・ストレージフォーマットの全面採用)は
+引き続き見送る——理由は「DataFusionと重複するから」ではなく、
+**「DuckDBが持つストレージ層固有の最適化(ゾーンマップ・辞書エンコード)
+は、DuckDB本体を導入しなくても、aruaru-query側で直接実装できる独立した
+技術要素だから」**へ再度差し替える(前回の「重複」という評価も、
+今回の8言語再調査でより正確に「実行モデルは重複するがストレージ最適化は
+別軸で未実装だった」と訂正)。この2点はコストを理由に見送らず実装した。
+
+### 実装した内容(`crates/aruaru-query/src/olap.rs`)
+
+1. **辞書エンコーディング**: `arrow_type`のText/デフォルト分岐を
+   `DataType::Utf8`(生のStringArray)から`DataType::Dictionary(Int32, Utf8)`
+   へ変更。`build_array`で`StringDictionaryBuilder<Int32Type>`を使い、
+   重複する文字列値を辞書へ1回だけ格納するよう構築。
+2. **ゾーンマップ**: `TableCache`に`zone_maps: HashMap<String, (f64, f64)>`
+   を新設、`compute_zone_maps`(Arrow標準の`compute::min`/`compute::max`
+   カーネルを使用)で数値列(Int64/Float64)ごとのmin/maxを計算し
+   `rebuild_full`/`rebuild_incremental`の両方で更新。`OlapCache::query`に
+   `extract_simple_range_predicate`(`SELECT ... FROM t WHERE col > N`
+   という最も単純な範囲述語だけを緩く抽出する正規表現ベースの抽出器、
+   GROUP BY/JOIN/OR句を含む場合は必ずマッチしない=安全側)と
+   `zone_map_disproves`(その範囲に該当行が絶対に無いと証明できるかの
+   判定)を追加。証明できる場合はDataFusionへ一切クエリを投げず即座に
+   空の結果を返す——DuckDBのRow Groupスキップと同じ「偽陽性は絶対に
+   起こさず、証明できない場合は常に安全側で通常実行する」設計。
+
+### 正直な簡略化点(誇張しない)
+
+1. **ゾーンマップの粒度はテーブル全体で1つ**——DuckDBはRow Group
+   (物理ブロック)単位で複数の統計区間を持ちブロック単位の部分スキップが
+   できるが、本実装は「テーブル全体が対象外」と証明できる場合のみ
+   スキップする、最も粗い粒度。
+2. **`extract_simple_range_predicate`は正規表現ベースの簡易抽出**であり、
+   完全なSQL式パーサではない——`col > N`/`col >= N`/`col < N`/`col <= N`
+   という最も単純な単一条件のみ対応、複合WHERE(AND/OR)・カラム同士の
+   比較・関数呼び出しを含む述語は対象外(マッチしなければ常に通常の
+   DataFusion経路にフォールバックするため、正しさへの影響はない)。
+3. **型認識軽量圧縮(RLE・ビットパッキング・FSST等)・out-of-core
+   スピル**は今回も実装していない——DataFusion自体がストリーミング実行・
+   パーティション並列を提供するため、aruaru-dbの現在の想定データ規模
+   (単一プロセス内メモリ常駐)では優先度が低いと判断した。
+4. **DuckDB本体の起動の軽さ・単一バイナリ配布**という別の強みは、
+   `aruaru-server`が既にプロセス内蔵型サーバーであるため引き続き
+   新規性を生まない(前回評価を維持)。
+
+### 検証結果(実測)
+
+- `cargo build -p aruaru-query --tests` → 成功。
+- `cargo test -p aruaru-query` → **56 passed / 0 failed**(前回52件+
+  新規4件: `text_columns_are_dictionary_encoded_and_still_aggregate_
+  correctly`〈辞書エンコードの実型検証+集計結果の正しさ〉、
+  `zone_map_prunes_queries_that_cannot_possibly_match_and_normal_
+  queries_still_work`〈枝刈りが機能すること+通常クエリが壊れないこと〉、
+  `extract_simple_range_predicate_only_matches_simple_range_queries`、
+  `zone_map_disproves_boundary_conditions`〈境界値7パターン〉)。
+- `cargo build --workspace` → 成功(既存警告2件のみ、無関係)。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件。
+- **実プロセスでのHTTP動作確認**: `aruaru-server.exe`を実際に起動し、
+  `POST /admin/federation/query`経由で`CREATE TABLE orders`→2行`INSERT`
+  (`region`列に`east`/`west`)→`SELECT region, SUM(amount) AS total FROM
+  orders GROUP BY region ORDER BY region`を実行、**辞書エンコードされた
+  `region`列を含むGROUP BYクエリが実際に正しい結果
+  (`{"region":"east","total":"100"}`/`{"region":"west","total":"999"}`)
+  を返す**ことを確認(型チェック・単体テストのみでの完了報告ではない)。
+
+### 次にすべきこと(次回候補)
+
+(1) ゾーンマップをRow Group相当の複数統計区間へ細分化する、
+(2) `extract_simple_range_predicate`をAND結合の複合述語(例:
+`WHERE a > 10 AND b < 20`)にも対応させる、(3) 型認識軽量圧縮
+(RLE/ビットパッキング)の要否は、実際のデータ規模がボトルネックになった
+時点で再評価する。
+
+## HANDOFF: 2026-08-21(続き5) ScyllaDB/Vitess/DuckDBの「実装方法そのもの」
+を本家ソース・設計文書レベルで再調査、murmur3ルーティング+適応的辞書
+エンコードを実装
+
+**経緯**: 直上までのHANDOFFは「機能として何を実装するか」を調査していたが、
+ユーザーから「本家(ScyllaDB/Vitess/DuckDB本体)の実際のソースコード・
+設計判断・アルゴリズムの詳細」まで踏み込んで比較し、改善できる点を実装へ
+反映するよう指示。英語・ドイツ語・中国語・韓国語・フランス語・スペイン語の
+6言語でWebSearchを実行し、本家の実装方法を調査した。
+
+### 調査結果と比較
+
+1. **ScyllaDBのtoken-aware routing**: GitHub `scylladb/scylladb`
+   Wikiの`Token`ページ・`scylladb.medium.com`のドライバ実装解説
+   (ドイツ語・スペイン語検索経由でも同内容に到達)を確認した結果、
+   ScyllaDBは**MurmurHash3**(`utils::murmur_hash::hash3_x64_128()`)を
+   使っており、**SHA-256のような暗号学的ハッシュ関数は使っていない**と
+   判明。前回実装(`crates/aruaru-query/src/sharded_store.rs`)は
+   `SHA-256(key) % shard_count`だったが、SHA-256は衝突耐性・原像計算
+   困難性のために意図的に低速に設計された関数であり、「高速さ」だけが
+   要件のルーティング用途には不釣り合いに重い。**MurmurHash3(32bit版)
+   の自前実装(`murmur3_32`、依存クレート追加なし)へ差し替えた**
+   ([Token · scylladb/scylladb Wiki](https://github.com/scylladb/scylladb/wiki/Token)、
+   [Making a Shard-Aware Python Driver for ScyllaDB](https://www.scylladb.com/2020/10/13/making-a-shard-aware-python-driver-for-scylla-part-1/))。
+   なお、ScyllaDB本家はさらにトークン空間全体を`2^n`個(既定n=12)に
+   分割し各片をシャード数`S`個に再分割するという二段階アルゴリズムを
+   持つが、これは**Cassandraワイヤプロトコル互換のtoken空間表現を保つ
+   ための固有要件**であり、本実装のような単純なポイントルックアップ用途
+   (ソート済みレンジスキャン互換性を要求しない)には過剰と判断し移植
+   していない(正直な開示、コードコメントに明記)。
+
+2. **Vitess Reshardの実データ移動**: 公式ドキュメント`vitess.io`
+   (フランス語検索経由でも同一の一次情報に到達)を確認した結果、実際の
+   Reshard/MoveTablesは**VReplication**(MySQLレプリケーションを使い、
+   VStreamで既存テーブル内容をコピーしつつ以降の変更を継続的にストリーム、
+   中断時は再開可能、切替は原子的)という、データそのものをコピーする
+   仕組みだと確認した。既存の`MultiRaftCluster::merge`はトポロジ構造の
+   統合のみでログ内容のマージは行っていない——この制約は前々回HANDOFF
+   で既に正直に開示済みであり、今回の調査でVitess本家との差分がより
+   具体的に裏付けられた形。**コード変更は見送り**: 本実装は単一プロセス
+   内の複数`RaftNode`インスタンスであり、VReplicationのような
+   ネットワーク越しレプリケーションストリームに相当する仕組み自体が
+   存在しないため、実データコピーの移植には`aruaru-dist`のRaft層全体の
+   設計変更が必要——今回のスコープを大きく超える(次回以降の課題として
+   記録を維持)。
+   ([Vitess VReplication Overview](https://vitess.io/docs/archive/22.0/reference/vreplication/vreplication/)、
+   [Vitess Reshard](https://vitess.io/docs/archive/13.0/reference/vreplication/reshard/))。
+
+3. **CockroachDBのRange Merge**(Vitessの併合と比較する上での補助調査):
+   公式tech-note `range-merges.md`を確認した結果、LHS(左側Range)が
+   RHSを吸収するという設計は本実装の`merge_ranges`(range_idが小さい方=
+   隣接順で左側を引き継ぐ)と方向性が一致していることを確認。ただし
+   CockroachDBは複数物理ノードにまたがるレプリカのRaft経由ガベージ
+   コレクション(吸収されなかったストアの孤立レプリカを`replica GC queue`
+   が回収する)という、単一プロセス構成の本実装には存在しない概念を持つ
+   ——これも構造的にコード変更の対象外
+   ([cockroach/docs/tech-notes/range-merges.md](https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/range-merges.md))。
+
+4. **DuckDBの圧縮analyzeフェーズ**: 公式ブログ
+   `duckdb.org/2022/10/28/lightweight-compression`・GitHub PR
+   (`duckdb/duckdb` #9635 ALP圧縮等、韓国語検索でも同一の一次情報に
+   帰着)を確認した結果、DuckDBは**セグメントごとに複数の圧縮方式
+   (定数・RLE・辞書・FSST・ビットパッキング・ALP等)を試算し、最も
+   小さくなるものを選ぶ「analyzeフェーズ」**を持つと判明。前回実装は
+   Text列に**無条件で**辞書エンコードを適用していたが、これはDuckDBの
+   「最良の方式を選ぶ」という核心を反映しておらず、高カーディナリティ
+   列(UUID列等)では辞書化がむしろ不利(辞書自体が行数近くまで肥大化)
+   になり得る。**修正**: `build_array`(`crates/aruaru-query/src/olap.rs`)
+   に、実データのユニーク値比率(`unique_count / total_non_null_count`)
+   が閾値(`DICTIONARY_CARDINALITY_THRESHOLD = 0.7`)未満のときのみ
+   辞書エンコードし、そうでなければプレーンな`Utf8`(`StringArray`)を
+   使う適応的選択を追加した。DuckDBの多数の圧縮アルゴリズム(RLE・FSST・
+   ALP等)の完全な移植は行っていない(正直な簡略化点、コードコメントに
+   明記)——「セグメントを見てから判断する」という核心的な設計思想のみを
+   簡易版で再現した。
+
+### 実装した内容
+
+- `crates/aruaru-query/src/sharded_store.rs`: `shard_for`を
+  `SHA-256(key) % shard_count`から自前実装の`murmur3_32`(MurmurHash3
+  x86 32bit版、依存クレート追加なし)へ差し替え。`sha2`依存を
+  `aruaru-query/Cargo.toml`から削除(他に使用箇所が無いことを確認済み)。
+  既知のテストベクタ(`murmur3_32(b"", 0) == 0`)による回帰テストを追加。
+- `crates/aruaru-query/src/olap.rs`: `build_array`のText/デフォルト分岐に
+  「ユニーク値比率が閾値未満なら辞書エンコード、そうでなければプレーン
+  Utf8」という適応的選択を追加。`arrow_type`関数を廃止し、`build_array`
+  自体が実際に採用した`DataType`を返してそのままスキーマFieldへ使う設計
+  (辞書化するか否かがデータ依存になったため、スキーマとデータの型不一致を
+  構造的に起こせないようにする変更)。新規テスト2件
+  (`high_cardinality_text_columns_skip_dictionary_encoding`で高
+  カーディナリティ列がプレーンUtf8のままであることを確認、既存の
+  `text_columns_are_dictionary_encoded_and_still_aggregate_correctly`は
+  低カーディナリティ側の従来通りの検証を維持)。
+
+### 検証結果(実測)
+
+- `cargo build -p aruaru-query --tests` → 成功。
+- `cargo test -p aruaru-query` → **58 passed / 0 failed**(前回56件+
+  新規2件: `murmur3_32_matches_known_test_vector_for_empty_input`、
+  `high_cardinality_text_columns_skip_dictionary_encoding`)。
+- `cargo build --workspace` → 成功(既存警告2件のみ、無関係)。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件。
+- **実プロセスでのHTTP動作確認**: `aruaru-server.exe`を実際に起動し、
+  (1) `POST /admin/sharded-store`で書き込んだキーが`shard_id: 29`
+  (murmur3ルーティング経由)へ実際に振り分けられ、`GET`で正しく
+  読み戻せることを確認。(2) `POST /admin/federation/query`経由で
+  `region`(低カーディナリティ、east/west)と`uuid`(高カーディナリティ、
+  全行ユニーク)の両方を持つテーブルを作成・10行投入し、
+  `GROUP BY region`(辞書エンコード列を含む集計)が正しい結果
+  (`east:50, west:50`)を返し、`COUNT(*)`(高カーディナリティのuuid列が
+  混在)も正しい結果(`10`)を返すことを確認。
+
+### 見送った点とその理由(コスト起因ではなく、構造的な理由)
+
+1. **ScyllaDBの二段階トークン分割(`2^n`分割+シャード再分割)**:
+   Cassandraワイヤプロトコル互換のtoken空間表現を保つための固有設計で
+   あり、本実装はそのような互換性要件を持たない単純なポイント
+   ルックアップ用途のため、単純な剰余ルーティングのままハッシュ関数
+   だけを本家と同じ思想(非暗号学的・高速)へ揃えた。
+2. **VitessのVReplicationによる実データコピー**: 本実装
+   (`MultiRaftCluster`)は単一プロセス内の複数`RaftNode`インスタンスで
+   あり、ネットワーク越しレプリケーションストリームに相当する仕組み
+   自体が構造的に存在しない——実データコピーの移植には`aruaru-dist`
+   のRaft層全体の設計変更が必要で、今回のスコープを超える。
+3. **DuckDBの多数の圧縮アルゴリズム(RLE・FSST・ALP・Chimp/Patas等)**:
+   「セグメントを見て最良の方式を選ぶ」という核心思想はユニーク比率
+   閾値で再現したが、個々のアルゴリズムの実装(FSST等)は文字列
+   圧縮アルゴリズムの新規実装が必要な規模であり、今回は見送った——
+   次回、実際のデータ規模がボトルネックになった時点で個別に検討する。
+
+### 次にすべきこと(次回候補)
+
+(1) `DICTIONARY_CARDINALITY_THRESHOLD`(現在0.7固定)を、実際の
+ワークロードでのメモリ/速度計測に基づいてチューニングする、(2) FSST等の
+文字列専用圧縮アルゴリズムの要否は実データ規模がボトルネックになった
+時点で再評価、(3) Vitess VReplication相当の実データストリーミング
+複製は、`aruaru-dist`のRaft層をopenraftベースの真のネットワーク越し
+実装へ移行する際にあわせて設計する。
+
+## HANDOFF: 2026-08-21(続き6) Snowflake×CockroachDB系ハイブリッドDBの再調査
+→ closed timestamp / follower read(CockroachDB・TiKV safe-ts・YugabyteDB
+方式)を新規実装。次回の調査目星も併記
+
+**経緯**: ユーザーより「SnowflakeとCockroachDBの両方の特性を持つ特殊な
+変種DBが世界中に存在する」という情報について再調査し、ギャップがあれば
+実装するよう指示。作業途中でユーザーから範囲縮小の指示(日本語ドキュメント
+のみ更新、詳細な調査本文は不要、次回の調査目星を残すだけで良い)を受けた
+ため、既に完了していた実装分とその検証結果を反映し、残りは次回候補の
+一覧として記録する形でまとめた。
+
+### 調査で分かったこと(要点のみ)
+
+- 「CockroachDBのRaft強整合 × Snowflakeのストレージ/コンピュート分離」を
+  そのまま名乗る単一製品は見つからなかった(検索結果からの正直な報告)。
+  ただし**両立を実際に成立させている共通の要素技術**として、
+  「読み取りをリーダー(leaseholder)以外のレプリカへ逃がす仕組み」が
+  CockroachDB / TiKV-TiDB / YugabyteDB のいずれにも存在することが判明:
+  - CockroachDB: Range単位の **closed timestamp**(この時刻以下に新しい
+    書き込みは今後現れないことの保証)を leaseholder が継続的に前進させ、
+    Raftログまたは **side transport** で follower へ通知。follower は
+    `read_ts <= closed_ts` の読み取りのみ自力で応答する。bounded
+    staleness read は「上限付き陳腐化を受け入れて時刻を交渉する」方式
+    ([follower reads RFC](https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20181227_follower_reads_implementation.md)、
+    [bounded staleness RFC](https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20210519_bounded_staleness_reads.md))。
+  - TiKV/TiDB: peerごとの **safe-ts**(leaderのみが持つresolved-tsとは
+    別概念)で、`read_ts <= safe-ts` ならローカルStale Read可
+    ([TiDB docs](https://docs.pingcap.com/tidb/stable/troubleshoot-stale-read/))。
+  - YugabyteDB: `yb_follower_read_staleness_ms`(既定30秒)の範囲で
+    follower から一貫スナップショット読み取り
+    ([YugabyteDB docs](https://docs.yugabyte.com/stable/explore/going-beyond-sql/follower-reads-ysql/))。
+
+### 発見したギャップ(コードで裏取り済み)
+
+`grep -rniE "lease|closed_timestamp|follower_read|bounded_staleness|
+as_of_system_time" crates` を実行した結果、**aruaru-dbにはlease /
+closed timestamp / follower read / bounded staleness に相当する概念が
+一切存在しなかった**(ヒットしたのはGitHub Release関連の無関係な語のみ)。
+READMEが「ストレージ/コンピュート分離 ✅」と表記しているにもかかわらず、
+「増やした読み取り専用の計算ノードが、リーダーへ問い合わせずに安全に
+読める根拠(時刻の保証)」が構造的に無かった、というのが今回の最大の発見。
+
+### 実装した内容
+
+- **`crates/aruaru-dist/src/closed_ts.rs`(新規)**
+  - `ClosedTimestampTracker`: Range単位のclosed timestamp。
+    `advance_to(now)`が`now - target_lag`(既定3秒、CockroachDBの
+    `kv.closed_timestamp.target_duration`既定値に倣う)まで前進させるが、
+    **進行中書き込み(`begin_write`/`end_write`で追跡)の最小時刻を跨がない**
+    ——跨いだ瞬間に「closed以下に新しい書き込みは現れない」保証が破れるため。
+    単調増加のみ(後退する通知は無視)。`can_serve_read_at(read_ts)`が
+    TiKVの`read_ts <= safe-ts`と同じ判定を行う。
+  - `ClosedTimestampCoordinator`: 複数Rangeを束ね、`advance_all`・
+    side transport相当の`publish_to(follower)`(冪等、未知Rangeは登録)・
+    `negotiate_bounded_staleness`(関与する全Rangeのclosed timestampの
+    **最小値**を採用、上限超過・未前進・未知Rangeは
+    `RouteToLeaseholder`へフォールバック)・`plan_exact_staleness_read`
+    (CockroachDBの`AS OF SYSTEM TIME follower_read_timestamp()`相当)を提供。
+  - `ReadPlan::{FollowerRead{timestamp, staleness_nanos}, RouteToLeaseholder{reason}}`。
+- **`crates/aruaru-dist/src/multi_raft.rs`**: `MultiRaftCluster`へ
+  `closed_ts`コーディネータを配線。`propose_at`/`commit_and_apply_at`
+  (書き込み時刻の登録・解除)、`advance_closed_timestamps`、キー列から
+  担当Rangeを解決して交渉する`plan_bounded_staleness_read`を追加。
+  `split`で生まれたRangeは自動登録、`merge`で消えたRangeは`forget_range`。
+- `crates/aruaru-dist/src/lib.rs`: 上記型を再エクスポート。
+
+### 正直な簡略化点(誇張しない)
+
+1. 時刻は**呼び出し側が渡す論理ナノ秒**。HLC・クロックスキュー上限
+   (CockroachDBの`max_offset`)は扱わない。
+2. **MVCC履歴読み取り本体には接続していない**。本実装は「その時刻で
+   読んでよいか」の安全性ゲートまで。実際に過去バージョンを読む処理は
+   既存のGit-on-SQL / `AS OF COMMIT`経路の責務として分離したまま。
+3. side transportは**同一プロセス内のオブジェクト間通知**
+   (`publish_to`)であり、ネットワーク越しの定期配送は未実装。
+4. Range横断の交渉は「最小値を取る」単純方式で、CockroachDBのように
+   ロックを避ける時刻交渉は行わない。
+5. **管理REST API(`/admin/*`)への公開・実プロセスHTTPでのE2E確認は
+   今回行っていない**(ユーザーの範囲縮小指示により中断)。検証は
+   `cargo build`/`cargo test`までに留まる——実機E2E未実施であることを
+   隠さず記録する。
+
+### 検証結果(実測)
+
+- `cargo test -p aruaru-dist` → **50 passed / 0 failed / 1 ignored**
+  (前回46件+新規6件: closed_ts側4件〈target lagでの前進と非後退、
+  進行中書き込みを跨がないこと、read_ts=0の拒否、side transportの冪等性、
+  Range横断の最小値採用、上限超過/未知Rangeのフォールバック、exact
+  stalenessの境界〉、multi_raft側2件〈`in_flight_write_blocks_follower_
+  read_until_it_commits`、`closed_timestamps_reach_a_read_only_replica_
+  via_side_transport`〉)。
+- `cargo build --workspace` → 成功(既存警告2件のみ、無関係)。
+- `cargo test --workspace` → 全テストバイナリで`test result: ok`、失敗0件。
+
+### 次回の調査・開発の目星(ユーザー指示により「当たり」だけを列挙)
+
+次回はまず以下を検索・一次資料確認してから着手する。括弧内は関係する
+crate。
+
+1. **Neon の pageserver / safekeeper 分離**(`aruaru-core`のストレージ層、
+   `aruaru-dist`): WALをsafekeeperがPaxosで多重化し、pageserverが
+   ページ再構成を担う「本当のストレージ/コンピュート分離」の実装形。
+   aruaru-dbのfjall直結構成との差分を具体的に洗う。
+2. **SingleStore(旧MemSQL)の rowstore/columnstore 単一テーブル同居**
+   (`aruaru-query::olap`): 現状のOlapCacheは別系統のキャッシュであり、
+   単一テーブル内での行/列の使い分けは未対応。
+3. **Databend / RisingWave のオブジェクトストレージ直結**
+   (`aruaru-backup`、`aruaru-core`): S3/オブジェクトストア上の
+   Parquetを一次ストレージとして扱う場合のメタデータ管理(スナップショット
+   ・マニフェスト方式)。`aruaru-backup/src/s3.rs`との接点を調べる。
+4. **CockroachDB Serverless / TiDB Serverless の弾力的コンピュート**
+   (`aruaru-server::ephemeral_pod`): 既存のephemeral SQL podを、
+   今回実装したclosed timestampと組み合わせて「読み取り専用podが
+   leaseholderへ問い合わせず動く」形まで実配線する。
+5. **今回実装分の残作業**(`aruaru-dist`、`aruaru-server`):
+   (a) closed timestampを管理REST API(`/admin/closed-timestamp/*`・
+   `/admin/follower-read/negotiate`)へ公開し実プロセスHTTPでE2E確認、
+   (b) side transportをネットワーク越し(`raft/transport.rs`)へ配線、
+   (c) `ReadPlan::FollowerRead`の時刻を既存の`AS OF COMMIT`読み取り経路へ
+   実際に橋渡しする(現状はゲート判定までで読み取り本体と未接続)。
+
+## HANDOFF: 2026-08-22(続き2) CPU SIMD(AVX-512/AVX2/FMA3/PCLMULQDQ)適用可否を
+実コードで調査 — RAID-Z2連携経路は`open-raid-z`側のSIMD化を自動継承、
+このリポジトリ本体はコード変更**不要**と判断(理由を明記)
+
+**経緯**: ユーザー指示「AVX-512があればRAID6パリティ・NVMe RAID6の
+ランダムアクセス・AI処理が高速化できるはず。5リポジトリで実装せよ」への
+対応の一環。**この開発機のCPUはAMD Ryzen 9 3950X(Zen 2)でAVX-512は
+非搭載**であり、実測できるのはAVX2/FMA3/SHA-NIまでである点を先に明記する。
+
+### 調査結果(推測せず`grep`と実クレートソースで確認)
+
+1. **このリポジトリ全体にSIMDコードは存在しなかった**
+   (`avx|simd|is_x86_feature|target_feature`でヒット0件)。
+2. **しかし主要なCPU律速処理は、既にSIMD対応済みのライブラリへ委譲済み
+   だった**——「SIMDコードが無い=最適化されていない」ではない点が
+   今回の最大の発見:
+   - **チェックサム(SHA-256、`aruaru-core/src/storage/mod.rs`)**:
+     依存する`sha2` 0.10.9のソース
+     (`src/sha256/x86.rs:100`)に
+     `cpufeatures::new!(shani_cpuid, "sha", "sse2", "ssse3", "sse4.1");`
+     があることを実際に確認した——**SHA-NI(SHA拡張命令)を実行時検出して
+     使う**設計であり、Zen 2はSHA-NI搭載のため**この開発機では既に
+     ハードウェア高速化が効いている**。手書きSIMDを追加する余地は無い
+     (追加すれば劣化する)。
+   - **OLAP列処理(`aruaru-query/src/olap.rs`)**: Apache Arrow +
+     DataFusion。`compute::min`/`max`(ゾーンマップ)・
+     `filter_record_batch`(インクリメンタルマージ)はいずれもArrowの
+     ベクトル化カーネルであり、Arrow側でSIMD化されている。
+     自前のバイトループを書き足す箇所は無い。
+   - **ハッシュルーティング(`aruaru-query/src/sharded_store.rs`)**:
+     2026-08-21に自前`murmur3_32`へ移行済み(非暗号学的・軽量)。
+     SIMD化の余地はあるが、キー1本ごとの数十バイト処理であり
+     ベクトル幅を活かせない(バッチ化されていない)ため効果が見込めない。
+3. **PCLMULQDQの適用先は無かった**: PCLMULQDQが効くのはCRC32や
+   GF(2^128)(GHASH)のような単一の広い多項式演算だが、このリポジトリの
+   チェックサムはSHA-256(上記の通りSHA-NIで既に高速)であり、CRC系の
+   ホットパスは存在しない。**適用先が無い箇所へ命令を持ち込むことは
+   しなかった**(`open-raid-z`側の同日HANDOFFに、バイト単位GF(2^8)演算に
+   PCLMULQDQが使えない技術的理由〈隣接バイトへの積のビット混入〉も
+   記録してある)。
+
+### 実際に効いた変更(このリポジトリのコードは1行も変えていない)
+
+`aruaru-dist`の`raid_z_backend`(`open_raid_z` feature、Raftコミット×
+RAID-Z2スナップショット連携)は`open_raid_z_core`をpath依存している。
+同日、`open-raid-z`側で**RAID6(RAID-Z2/Z3)のP/Q/Rパリティ計算を
+CPU SIMD化**したため(`zfs_accel_hlsl/src/simd.rs`新設、実行時検出で
+AVX-512F+BW → AVX2 → SSE2/SSSE3 → スカラー)、**この連携経路は再ビルド
+するだけで自動的にその恩恵を受ける**。
+- `open-raid-z`側の実測(Ryzen 9 3950X、検出経路`avx2`):
+  P/Q生成 **8.94〜14.89倍**、P/Q/R生成 **9.21〜13.95倍**、
+  任意係数GF(2^8)乗算 **30.96倍**(いずれもGF乗算テーブル引き実装比)。
+  詳細・ベンチマークの前提条件は`open-raid-z/CLAUDE.md`の同日エントリ参照。
+- **NVMe 4枚以上のRAID6構成でランダムアクセスが速くなる、という主張は
+  していない**——上記はパリティ計算そのものの所要時間であり、
+  実NVMe SSDを4枚以上使った実機IOPS測定はこの開発機に該当構成が無いため
+  **未実施**。ただしRAID6のランダム書き込みはRead-Modify-Writeで
+  パリティ再計算が都度発生し、ディスク本数が増えるほど倍率が上がる
+  (8.9倍→14.9倍)ことは実測済みであり、CPU側パリティ計算がボトルネックに
+  なる場面ほど効くという方向性自体は妥当。
+
+### TEST(実測)
+
+- `cargo test -p aruaru-dist --features open_raid_z --release` →
+  **62 passed / 0 failed / 1 ignored**。SIMD化された
+  `open_raid_z_core`とリンクした状態で、実RAID-Z2プールへの
+  実`create_snapshot`を伴う`real_raft_commit_triggers_real_raid_z_
+  snapshot`を含め全green——**パリティ計算のアルゴリズムを
+  ホーナー法+SIMDへ差し替えても、このリポジトリ側の連携動作に
+  回帰が無いことを実測で確認した**。
+- このリポジトリのコード変更が無いため、他クレートのテストは前回
+  エントリの状態から変化しない。
+
+### 正直な開示・未実施
+
+- **AVX-512経路は`open-raid-z`側でコンパイル確認のみ**(この開発機が
+  非搭載のため実行・ベンチマーク未実施)。AVX-512搭載機へ載せ替えれば
+  コードの書き足し無しに`simd_level()`が`Avx512`を返して有効になる設計。
+- 実NVMe 4枚以上でのRAID6ランダム書き込みIOPS測定は未実施。
+- このリポジトリ本体へのSIMDコード追加は**意図的に見送った**——上記の
+  通り主要ホットパスが既にSIMD対応ライブラリ(sha2 + SHA-NI、
+  Arrow/DataFusion)へ委譲済みであり、手書きSIMDを重ねても改善しない
+  (むしろ保守負債になる)という判断。「コストが高いから見送った」のでは
+  なく「適用先が無いことをコードで確認した」ことを明記する。
+- 次にすべきこと: (1) AVX-512搭載機を入手した際に、`open-raid-z`の
+  `simd_parity_benchmark`を実行した上で、このリポジトリの
+  `raid_z_backend`経由のスナップショット所要時間も併せて測る。
+  (2) 将来`aruaru-query::olap`に自前のバッチ処理(bloom filter一括判定・
+  sparse index等、前回エントリの次回候補)を書く場合は、その時点で
+  初めてSIMDの適用余地が生まれるため再評価する。(3) CPU機能検出は
+  将来、共有クレート`open-cpu`(`aon-co-jp/open-cpu`、別セッションで
+  作成中)へ集約する方針が決まっている(2026-08-22ユーザー指示)。
+
+## HANDOFF: 2026-08-22 Neon の pageserver/safekeeper 分離を一次資料で調査、
+WAL サービス層(safekeeper quorum + pageserver)を新規実装
+
+**経緯**: 前回エントリ(2026-08-21(続き6))で「次回の調査目星」として
+残した1件目、**Neon の pageserver / safekeeper 分離**を日本語・英語
+両方で検索し、一次資料(`neondatabase/neon`リポジトリ内の設計ドキュメント)
+で裏取りしてから実装した。
+
+### 調査で確認したこと(一次資料)
+
+- [`docs/walservice.md`](https://github.com/neondatabase/neon/blob/main/docs/walservice.md):
+  compute が生成した WAL は複数の **safekeeper** へストリームされ、
+  「**過半数の safekeeper がローカルディスクへ書き終えた時点で durable**」
+  と見なされる。safekeeper 群は Paxos ベースの合意で WAL を多重化し、
+  **単一 primary の強制**(2つの compute が同時に書くことの防止)も担う。
+  pageserver は primary からではなく **safekeeper 群から** streaming
+  replication で WAL を引く。safekeeper は「一時的な耐障害ストレージ」で
+  あり、最終的な永続化先は S3。
+- [`docs/safekeeper-protocol.md`](https://github.com/neondatabase/neon/blob/main/docs/safekeeper-protocol.md):
+  proposer は `(term, UUID)` の NodeID を持ち、**term は proposer 起動
+  ごとに増加**して split-brain を防ぐ。safekeeper は自分が受理済みの
+  NodeID 以上の提案のみ受理する。`commitLSN` は「全 safekeeper の
+  `flushLSN` を並べた配列の `flushLsn[n - quorum]` 要素」=
+  **quorum 番目に大きい flushLSN**。
+- [`docs/pageserver-storage.md`](https://github.com/neondatabase/neon/blob/main/docs/pageserver-storage.md)
+  ・ブログ["Deep dive into Neon storage engine"](https://neon.com/blog/get-page-at-lsn):
+  pageserver は WAL を継続的に取り込み、ページ単位に切り分けて
+  **要求 LSN のページを image layer + delta layer から再構成**する
+  (`get_page_at_lsn`)。対応する WAL が届くまでページ要求に応答しない
+  ことで一貫性を保証し、`max_replication_*_lag` でバックプレッシャをかける。
+
+### 発見したギャップ(コードで裏取り済み)
+
+`grep -rniE "safekeeper|pageserver|wal_service|commit_lsn|lsn" crates`
+を実行した結果、`crates/`内で LSN に言及していたのは
+`aruaru-core/src/version/mod.rs`の`create_branch_from`の**コメント**
+(Neon 方式ブランチングの説明)だけであり、**WAL を独立した quorum で
+耐久化する層、および「LSN 指定でページを再構成する層」は一切存在
+しなかった**。既存の`aruaru-dist::raft`は「合意 + 状態機械への適用」を
+同一ノード内で一体に行う構成で、Neon の中核設計である
+「WAL の耐久化(safekeeper)とページ再構成(pageserver)の分離」は無かった。
+
+### 実装した内容
+
+- **`crates/aruaru-dist/src/wal_service.rs`(新規、約620行)**
+  - `Safekeeper`: `accepted_term`による fencing、`flush_lsn`、
+    WAL の`accept`(LSN 単調増加を強制)・`stream(after, up_to)`・
+    pageserver 取り込み済み分の解放`truncate_up_to`。
+  - `WalService`: n 台の safekeeper を束ねる。`quorum() = n/2+1`。
+    `start_proposer()`が既存最大 term + 1 を全 safekeeper へ通知して
+    **古い proposer を fence**(単一 primary 強制)。`append(term, records)`
+    は quorum の ack を要求し、`recompute_commit_lsn()`で
+    **全 flush_lsn を降順に並べた quorum 番目**を commitLSN として採用
+    (Neon の`flushLsn[n - quorum]`と同じ計算)。commitLSN は単調増加のみ。
+    `stream_committed(after)`で pageserver へ配る。
+  - `Pageserver`: `ingest(&WalService)`で commitLSN までを取り込み
+    `last_record_lsn`を進める。`get_page_at_lsn(key, lsn)`が
+    image layer + delta layer からページを再構成し、
+    未着 LSN は`WalNotArrived`で拒否(Neon の「WAL が届くまで応答しない」)。
+    `create_image_layer(key, lsn)`が materialize + 以前の delta 破棄
+    (compaction)、それ未満の読み取りは`BelowGcCutoff`として**再構成
+    できないことを明示**。`check_replication_lag`がバックプレッシャ。
+  - `DisaggregatedStorage`: 上2つを束ね、`write(records)`(lag 検査 →
+    quorum 耐久化 → pageserver 取り込み)と`read_latest(key)`を提供。
+  - `PageDelta::{Replace, Append}` / `WalRecord` / `WalServiceError`。
+- `crates/aruaru-dist/src/lib.rs`: 上記型を`pub mod` + 再エクスポート。
+
+### 正直な簡略化点(誇張しない)
+
+1. **同一プロセス内のオブジェクト分離**であり、ネットワーク越しの
+   streaming replication は未実装。
+2. Paxos の完全実装ではない。**term による fencing と quorum flushLSN
+   による commitLSN 決定**という核だけを実装(投票フェーズでの WAL
+   突き合わせ・term_history の復旧は未実装)。
+3. ストレージは**メモリ上**(`BTreeMap`)。Neon の layer file / S3
+   アップロードに相当する永続化は未実装(`aruaru-backup`との接続は次回)。
+4. `PageDelta`は`Replace`/`Append`の2種のみで、PostgreSQL WAL の
+   `redo`再生ではない。
+5. 既存の SQL 実行経路・`AS OF COMMIT`読み取り・管理REST API には
+   **未接続**。本モジュール単体で完結する層として追加している
+   (前回の closed timestamp と同じ状況——両者を実経路へ橋渡しする
+   作業がまとめて残っている)。
+
+### 検証結果(実測)
+
+- `cargo test -p aruaru-dist` → **61 passed / 0 failed / 1 ignored**
+  (前回50件 + 新規11件: commitLSN の quorum 番目採用・非後退、
+  新 proposer による旧 proposer の fence、quorum 未達、LSN 非単調の拒否、
+  過去 LSN でのページ再構成、未着 LSN の拒否、image layer 生成と
+  GC cutoff、バックプレッシャ、取り込み後の WAL 解放、未知ページ)。
+- 実装中に`image_layer_materializes_and_drops_older_deltas`が
+  `PageNotFound`で**実際に失敗**した(image layer より前の LSN を
+  読もうとしたケース)。誤って image の内容を返すのは不正確なため、
+  `BelowGcCutoff`エラーを新設して「再構成できない」ことを明示する形に
+  修正した——テストを緩めずに設計を直した。
+- `cargo build --workspace` / `cargo test --workspace` の結果は下記
+  「ワークスペース全体の検証」に記載。
+
+### 次回の調査・開発の目星(更新版)
+
+前回リストのうち 1.(Neon)は今回着手済み。残りは以下。
+
+1. **今回実装分と前回実装分の「実経路への橋渡し」**(`aruaru-dist`、
+   `aruaru-server`、`aruaru-query`): (a) closed timestamp / WAL サービス
+   を管理REST API(`/admin/closed-timestamp/*`、`/admin/wal-service/*`)へ
+   公開し実プロセス HTTP で E2E 確認、(b) `ReadPlan::FollowerRead`の時刻と
+   `Pageserver::get_page_at_lsn`を既存の`AS OF COMMIT`読み取り経路へ接続、
+   (c) side transport / WAL ストリームをネットワーク越し
+   (`raft/transport.rs`)へ配線。**この橋渡しが2セッション分たまっている
+   ため、次回はここを優先するのが妥当**。
+2. **SingleStore(旧MemSQL)の rowstore/columnstore 単一テーブル同居**
+   (`aruaru-query::olap`)。
+3. **Databend / RisingWave のオブジェクトストレージ直結**
+   (`aruaru-backup`、`aruaru-core`)。今回の`Pageserver`をメモリから
+   S3(`aruaru-backup/src/s3.rs`)上の layer file へ載せる話と直結する。
+4. **CockroachDB Serverless / TiDB Serverless の弾力的コンピュート**
+   (`aruaru-server::ephemeral_pod`)。今回の pageserver 分離と
+   前回の closed timestamp を組み合わせ、読み取り専用 pod を実配線する。
+
+## HANDOFF: 2026-08-22(続き) 方針拡大 — ハイブリッド/HTAP系DBの要素技術を
+多言語(日英中韓)で横断調査し、優先度の高い3件を実装
+
+**経緯**: ユーザーより「前回HANDOFFの目星に限定せず、一から世界中の言語で
+Google/GitHub検索を行い、Snowflake×CockroachDB型ハイブリッドDBに関連する
+重要な技術要素を広く洗い出し、優先度の高いものから複数件を実装に反映する
+こと」という拡大指示を受けた。前回済みの follower reads / closed timestamp
+系(`closed_ts.rs`)は重複調査しない前提。
+
+### 今回の調査対象と、一次資料で確認した要素技術
+
+| # | 技術要素 | 出典(調査言語) | aruaru-db の状況 |
+|---|---|---|---|
+| 1 | Neon: safekeeper(WAL の Paxos quorum)と pageserver(ページ再構成)の分離、`commitLSN = flushLsn[n-quorum]`、term による単一primary強制、`get_page_at_lsn` | `neondatabase/neon`の`docs/walservice.md`・`docs/safekeeper-protocol.md`・`docs/pageserver-storage.md`(英/日) | **無かった → 実装した**(`aruaru-dist/src/wal_service.rs`) |
+| 2 | SingleStore Universal Storage: columnstore を segment 単位で持ち、hash index・subsegment access・行レベルロックで OLTP も columnstore で処理 | `docs.singlestore.com`の"Universal Storage"・"Choosing a Table Storage Type"(英) | 部分的。**segment 単位統計が無かった → 実装した**(`aruaru-query/src/olap.rs`)。hash index・行レベルロックは未実装 |
+| 3 | Databend: snapshot(`_ss/*.json`)→ segment(`_sg/*.json`、最大1000 block)→ block(parquet)の3層メタデータ、min/max・sparse index・bloom filter、**MetaSrv の Snapshot Key 書き込み成功=コミット成功**という ACID の根拠 | 「Databend 存储架构总览」「Databend 索引结构说明」(中国語一次資料、`cnblogs.com/databend`・`zhuanlan.zhihu.com`) | **無かった → 実装した**(`aruaru-backup/src/table_format.rs`) |
+| 4 | RisingWave: Hummock(共有 LSM state store)。shared buffer + オブジェクトストレージ、**Barrier に紐づく epoch を MVCC バージョンとして使う**チェックポイント方式 | `docs.risingwave.com/store/overview`、`risingwave.com/blog/hummock-a-storage-engine-designed-for-stream-processing`(英) | 未実装。ストリーミング(materialized view の増分維持)という別軸の前提が必要なため今回は見送り——**「該当なし」ではなく「未着手」**として記録 |
+| 5 | Snowflake Hybrid Tables(GA): 行ストアを一次ストアとし行ロックで高並行 OLTP、列側は分析用。HTAP を「unified storage / decoupled storage」に分類する整理 | `docs.snowflake.com/en/user-guide/tables-hybrid`(英)、HTAP survey `arxiv.org/pdf/2404.15670`(韓国語検索経由で発見) | 分類上 aruaru-db は **decoupled storage 型**(行ストア + `OlapCache` 列レプリカ)。単一テーブル内での行/列併存(SingleStore の #2 の完全形)は未実装 |
+
+### 実装した内容(3件)
+
+1. **`crates/aruaru-dist/src/wal_service.rs`(新規)** — Neon 方式。
+   詳細は直前の HANDOFF エントリを参照。
+2. **`crates/aruaru-query/src/olap.rs`(改修)** — セグメント単位ゾーンマップ。
+   従来はコード内にも「テーブル全体で1ブロック分の min/max しか持たない
+   (DuckDB のようなブロック単位の部分スキップは行わない)」と正直な
+   簡略化点として明記されていた箇所。SingleStore(segment)・Databend
+   (block)・DuckDB(Row Group)がいずれも**セグメント単位統計で部分
+   スキップ**している共通点を確認したため:
+   - `SegmentStats { offset, len, zone_maps }`を導入し、ベース列バッチを
+     `segment_rows`行(既定1024、`OlapCache::with_segment_rows`で変更可)
+     ごとに区切って各セグメントの min/max を保持。
+   - `query()`は、単純範囲述語に対して**該当行が絶対に無いと証明できた
+     セグメントを DataFusion へ渡さない**。生き残ったセグメントは
+     `RecordBatch::slice`(ゼロコピー)として1パーティションずつ登録する
+     ため、枝刈りと DataFusion のパーティション並列が同時に効く。
+   - 枝刈り結果は`plan_segment_pruning(sql) -> (table, 残数, 全数)`で観測可能。
+     偽陽性(該当行があるのに読み飛ばす)は構造上起こさない設計を維持。
+3. **`crates/aruaru-backup/src/table_format.rs`(新規)** — Databend 方式の
+   オブジェクトストレージ直結テーブルフォーマット。
+   - `ObjectStore`トレイト + `InMemoryObjectStore`。パス構成は Databend に
+     倣い`<root>/<db_id>/<table_id>/_ss/<32桁16進>_v1.json`(snapshot)・
+     `.../_sg/<32桁16進>_v1.json`(segment)。
+   - `BlockMeta`(min/max の`ColumnStats` + 等値述語用`BloomFilter`)、
+     `SegmentMeta`(block 集約統計、**1000 block 超過は
+     `SegmentTooLarge`で拒否**)、`TableSnapshot`(`prev_snapshot_id`の
+     連鎖で時間旅行)。
+   - `MetaService`(MetaSrv 相当)の**楽観的 CAS が成功して初めてコミット
+     成立**——古い親スナップショットの上へ書こうとすると
+     `CommitConflict`。書かれたオブジェクトは孤児として残る(Databend も
+     vacuum 対象として扱う)ことをコメントに明記。
+   - `prune_range`は**segment 統計で丸ごと読み飛ばせる場合 segment 内の
+     block を一切見ない**(Databend が segment 側にも min/max を持つ理由)。
+     戻り値で読み飛ばした segment 数・block 数を報告。`prune_equality`は
+     bloom filter による等値枝刈り(索引が無い block は安全側で残す)。
+
+### 正直な簡略化点(誇張しない)
+
+- `wal_service.rs`: 同一プロセス内、Paxos 完全実装ではない(term fencing +
+  quorum flushLSN のみ)、ストレージはメモリ、`redo`再生ではない、
+  既存 SQL 経路・管理 REST API へ未接続。
+- `olap.rs`: bloom filter・sparse index は未実装(min/max のみ)。
+  述語は`extract_simple_range_predicate`が拾える単純形のみ。
+- `table_format.rs`: **同梱の`ObjectStore`実装はメモリのみで、既存の
+  `s3.rs`(`S3Client`)へは未接続**。block 実体(Parquet)の書き出しも
+  行わない(メタデータ階層と枝刈り・コミットの正しさが担当範囲)。
+  sparse index 未実装。CAS リトライループは呼び出し側責務。
+- RisingWave Hummock(epoch/barrier ベースのチェックポイント)と
+  SingleStore の hash index / 行レベルロック / subsegment access は
+  **今回未実装**。「対応済み」とは書かない。
+
+### 検証結果(実測、2026-08-22)
+
+- `cargo build --workspace` → **成功**(警告は既存の`build_cluster`/
+  `propose_commit` dead_code 2件のみ、今回の変更とは無関係)。
+- `cargo test --workspace` → **全テストバイナリで`test result: ok`、
+  失敗0件**。内訳: aruaru-backup 33 passed(うち`table_format`新規10件)、
+  aruaru-core 14、aruaru-dist 61 passed/1 ignored(うち`wal_service`
+  新規11件)、aruaru-graphql 6、aruaru-migrate 9、aruaru-query 59
+  (うちセグメント枝刈り新規1件)、aruaru-registry 5、aruaru-server
+  3 passed/1 ignored、aruaru-wire 10、統合テスト2件は従来通り ignored
+  (実バイナリ起動が必要なもの)。
+- 実装中に`image_layer_materializes_and_drops_older_deltas`が実際に
+  失敗し、`BelowGcCutoff`エラーを新設して設計を直した(テストを緩めて
+  通したのではない)。
+- **未実施**: 実プロセス HTTP を立てた E2E 検証(管理REST API への公開が
+  まだ無いため)。「コンパイル+単体テストまで」であることを明記する。
+
+### 次回への引き継ぎ(2026-08-22時点、優先順)
+
+1. **橋渡しが3セッション分たまっている**: `closed_ts`(08-21)・
+   `wal_service`(08-22)・`table_format`(08-22)はいずれも
+   **既存のSQL実行経路・管理REST APIへ未接続**。次回はここを優先する:
+   (a) `/admin/wal-service/*`・`/admin/closed-timestamp/*`・
+   `/admin/object-table/*`を`aruaru-server`へ公開し、実プロセスHTTPで
+   E2E確認、(b) `Pageserver::get_page_at_lsn`と`ReadPlan::FollowerRead`を
+   既存の`AS OF COMMIT`読み取り経路へ接続、(c) `table_format`の
+   `ObjectStore`実装を既存の`s3.rs`(`S3Client`、非同期)へ接続。
+2. **RisingWave の Hummock**(未着手): Barrier に紐づく epoch を MVCC
+   バージョンとして使うチェックポイント方式。aruaru-db に
+   materialized view の増分維持が無いため前提整備が必要。
+3. **SingleStore の残り要素**: columnstore 上の hash index・
+   行レベルロック・subsegment access(単一テーブル内での行/列併存の完全形)。
+4. **`olap.rs`のセグメント統計の拡張**: bloom filter・sparse index
+   (今回は min/max のみ)。`table_format.rs`側には bloom filter が
+   あるので、実装を寄せられる可能性がある。
+
+## HANDOFF: 2026-08-24 前回までの「橋渡しが3セッション分たまっている」を解消
+— FollowerRead→AS OF COMMIT接続・side transportのネットワーク越し配線・
+ObjectStoreの実S3クライアント接続を実装、実プロセスHTTP/複数プロセス間で検証
+
+**経緯**: 直前2回のHANDOFF(2026-08-22・2026-08-22続き)が「次回優先」
+として挙げていた3項目のうち、具体的に指示された3つ((b)FollowerReadの
+実データ接続、(c)side transportのネットワーク越し配線、および
+`table_format`の`ObjectStore`実S3接続)に着手した。(a)の管理REST API
+公開自体は既に別コミット(`6e6286f`)で先行完了していたため、今回は
+「公開されているが中身が繋がっていなかった」箇所を実装で埋める形になった。
+
+### タスク1: `ReadPlan::FollowerRead`を`AS OF COMMIT`読み取り経路へ実接続
+
+- `crates/aruaru-core/src/version/mod.rs`: `VersionController::
+  find_commit_at_or_before(timestamp_nanos: i64) -> Option<Commit>`を
+  新設。現在ブランチのHEADから祖先方向へたどり、`commit.timestamp <=
+  timestamp_nanos`を満たす最初の(=最も新しい)コミットを返す。
+- `crates/aruaru-query/src/engine.rs`: `QueryEngine::select_follower_read
+  (table, filter, timestamp_nanos) -> Result<QueryResponse, String>`を
+  新設。上記でcommitへ解決し、既存の`select_as_of`(Prolly Tree経由の
+  `AS OF COMMIT`本体)へそのまま委譲する。`aruaru-query`が`aruaru-dist`に
+  依存しない既存設計を保つため、`ReadPlan`型そのものではなく解決済みの
+  生タイムスタンプ(i64、Unixナノ秒)を受け取る設計とした——`ReadPlan`
+  から実際に呼び出す橋渡しは両クレートに依存できる`aruaru-server`側の
+  責務とした。
+- `crates/aruaru-server/src/admin.rs`: 既存の`POST /admin/closed-
+  timestamp/plan`に`table`/`filter_col`/`filter_val`という省略可能な
+  フィールドを追加。`ReadPlan::FollowerRead`と判定され`table`が指定
+  された場合のみ、`select_follower_read`で実際にデータを読み出し
+  レスポンスの`data`フィールドへ含める(`RouteToLeaseholder`の場合は
+  読み取りを行わず理由のみ返す、後方互換——`table`未指定なら従来通り
+  ゲート判定のみ)。
+
+### タスク2: side transportをネットワーク越し(`raft/transport.rs`)へ配線
+
+- `crates/aruaru-dist/src/closed_ts.rs`: `ClosedTimestampCoordinator`に
+  `snapshot_closed_timestamps()`(送信側、`(range_id, closed_ts)`の
+  スナップショットを取り出す)と`apply_closed_timestamp_updates(&[..])`
+  (受信側、未知Rangeは登録しつつ取り込む、冪等)を新設。既存の
+  `publish_to`(同一プロセス内)はこの2つの組み合わせとして再実装した。
+- `crates/aruaru-dist/src/raft/transport.rs`: `HttpTransport`
+  (AppendEntries/RequestVoteの送信、`x-admin-token`ヘッダー付与)と
+  同じパターンで`HttpSideTransport`を新設。`publish_to(peer, updates)`
+  が指定peerの`POST /admin/closed-timestamp/receive`へ実際にHTTP POST
+  する。
+- `crates/aruaru-server/src/admin.rs`: 受信側`POST /admin/closed-
+  timestamp/receive`(他ノードからの更新を取り込む)と送信側
+  `POST /admin/closed-timestamp/publish`(`peer_id`+`peer_url`を指定して
+  `HttpSideTransport`経由で実際に配布する)を新設。既存の`/admin/*`
+  共通認証ミドルウェアがそのまま適用される(個別実装不要)。
+- **正直な簡略化点**: CockroachDBの`closedts/sidetransport`のような
+  バックグラウンドでの周期的自動配送は実装していない——呼び出し側が
+  `POST /admin/closed-timestamp/publish`を能動的に呼ぶ必要がある。
+
+### タスク3: `table_format::ObjectStore`を実S3クライアントへ接続
+
+- `crates/aruaru-backup/src/s3.rs`: `impl ObjectStore for S3Client`を
+  新設。`ObjectStore`トレイトは同期(`put`/`get`/`list`、`async`でも
+  `Result`でもない)だが`S3Client`のI/Oは非同期のため、`run_blocking`
+  (`std::thread::scope`で専用OSスレッドを立て、その中で
+  `tokio::runtime::Builder::new_current_thread`の新規ランタイムを
+  `block_on`する)でブリッジした——呼び出し元が既にtokioランタイム上
+  (`aruaru-server`の非同期ハンドラ等)にいても`Cannot start a runtime
+  from within a runtime`を起こさない設計(`#[tokio::test]`内から呼ぶ
+  回帰テストで実証)。`list()`は`S3Client`自身のバケットレベル`prefix`
+  を`strip_client_prefix`で取り除き、`put`/`get`が受け取るのと同じ
+  「パス」名前空間の文字列を返すようにし、`InMemoryObjectStore`との
+  契約(`list()`が`put()`に渡した文字列をそのまま返す)を保った。
+- **正直な限界**: `ObjectStore`トレイト自体はエラーを表現できない
+  (`put`は`()`、`get`は`Option`、`list`は`Vec`を返す設計のまま)ため、
+  失敗は`tracing`へログするに留め、`get`/`list`は「見つからなかった
+  ことにする」形へ縮退する——ネットワーク瞬断とオブジェクト不在の
+  区別がこのAPI形状では呼び出し元から見分けられないという制約が残る
+  (トレイト自体を`Result`化する改修は既存の全呼び出し元・
+  `InMemoryObjectStore`・既存テストに影響するため今回は見送った)。
+  実S3/MinIOサーバーへの実際のPUT/GET往復は、既存の`put_object`/
+  `get_object`/`list_objects`自体のテストと同じ理由(この環境に到達
+  可能なS3互換サーバーが無い)で未検証——`strip_client_prefix`の
+  ロジックとsync/asyncブリッジが多重ランタイムでデッドロックしない
+  ことは単体テストで検証済み。
+
+### 検証結果(実測、型チェック・ビルド成功だけで終わらせない方針の徹底)
+
+- `cargo build --workspace` → 成功(既存の`build_cluster`/
+  `propose_commit`未使用警告2件のみ、無関係)。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件(新規追加分: aruaru-backup +4〈`strip_client_prefix`2件・
+  `run_blocking`のランタイムネスト回帰・`ObjectStore`実装の型検証〉、
+  aruaru-dist +1〈`snapshot_closed_timestamps`/`apply_closed_timestamp_
+  updates`往復〉、aruaru-query +1〈`select_follower_read`の
+  タイムスタンプ解決〉)。
+- **実プロセスHTTPでのE2E確認(型チェック・単体テストのみで終わらせない)**:
+  1. **タスク1**: 実`aruaru-server.exe`を1台起動し、`CREATE TABLE
+     items`→`INSERT (qty=1)`→`aruaru_commit`→`UPDATE (qty=5)`→
+     `aruaru_commit`→`POST /admin/closed-timestamp/range`→
+     `POST /admin/closed-timestamp/advance`(closed timestampを両
+     コミットより後まで前進)→`POST /admin/closed-timestamp/plan`
+     (`table=items`,`filter_col=id`,`filter_val=sword`)を実行し、
+     **`"plan":"follower_read"`かつ`"data":{"ok":true,"result":
+     {"Rows":{"columns":["id","qty"],"rows":[[{"Text":"sword"},
+     {"Text":"5"}]]}}}}`という実データが実際に返る**ことを確認した
+     (ゲート判定だけでなく実データ読み取りまで到達する直接証拠)。
+  2. **タスク2**: 実`aruaru-server.exe`を2台(port 7401/7402)起動し、
+     server1で`range_id=1`を登録・前進させた後、server1へ
+     `POST /admin/closed-timestamp/publish`(`peer_id=2,
+     peer_url=http://127.0.0.1:7402`)を実行。**server2の
+     `GET /admin/closed-timestamp`が`range_count:0`→`range_count:1`
+     (`closed_timestamp`がserver1と完全一致)へ実際に変化する**ことを
+     確認した——別プロセス・別ポート間の実HTTP通信によるside
+     transportの直接証拠。再送すると`advanced_on_peer:0`(冪等)、
+     `x-admin-token`無しでの`/admin/closed-timestamp/receive`は
+     `401`(既存認証ミドルウェアが新規エンドポイントにも自動適用
+     されることも確認)。
+  3. タスク3(S3実接続)は、この環境に到達可能なS3互換サーバーが
+     無いため実HTTP往復のE2E確認は未実施(上記「正直な限界」参照)。
+- 検証後、両プロセス・一時データディレクトリはすべて終了・削除済み
+  (リポジトリへの影響なし)。
+
+### 次回への引き継ぎ
+
+1. side transportの定期的自動配送(バックグラウンドループでの
+   周期publish)——現状は手動トリガーのみ。
+2. `table_format::ObjectStore`を実S3/MinIOサーバーで実際に往復検証
+   (この環境にサーバーが無いため次回以降、到達可能な環境で)。
+3. `ObjectStore`トレイト自体の`Result`化(エラーの握りつぶしを解消)は
+   既存呼び出し元全体への影響があるため、必要性が具体化した時点で
+   改めて設計する。
+4. `Pageserver::get_page_at_lsn`(`wal_service.rs`)の実経路への接続は
+   今回スコープ外——`ReadPlan::FollowerRead`とは別の橋渡し先であり、
+   次回以降の課題として残る。
+
+## HANDOFF: 2026-08-25 セキュリティ監査(cargo audit)を実施
+
+open-english側のユーザー指示「関連リポジトリのセキュリティ監査(依存
+関係・入力検証等)」への対応(横断的な優先判断はopen-english/CLAUDE.md
+2026-08-25エントリ参照)。
+
+1. **`h2`(0.4.15、DoS脆弱性RUSTSEC-2026-0258)を0.4.19へ更新**
+   (`aruaru-db`本体・`web`サブクレートとも`cargo update -p h2`で
+   互換範囲内更新、コード変更不要)。
+2. **`quick-xml`のHigh(CVSS 7.5)脆弱性2件を修正**
+   (「Quadratic run time when checking a start tag for duplicate
+   attribute names」「Unbounded namespace-declaration allocation in
+   `NsReader` enables memory-exhaustion denial of service」)。
+   `crates/aruaru-backup`が使う`rusty-s3`(S3互換バックアップ先の
+   署名付きURL生成)の依存で、`rusty-s3`自体を0.7→**0.10**へ
+   アップグレードして解消(`quick-xml`側は`rusty-s3`の内部依存の
+   ため直接触れず)。`cargo build --release`(ワークスペース全体、
+   11分33秒)成功、`cargo test --release -p aruaru-backup`
+   **37 passed / 0 failed**を確認。
+3. **未修正のまま記録する事項(正直な開示)**: `rustls-webpki`
+   (0.101.7、複数の証明書検証系issue)が、`crates/aruaru-registry`の
+   `mongodb 2.8.2`が引き込む古い`rustls 0.21`経由で残っている。
+   `mongodb`は3.8.1(メジャーバージョン)が利用可能だが、**データベース
+   エンジンという性質上、API破壊的変更を伴うメジャーバージョン移行を
+   専用のテスト計画無しに拙速に行うのは避けるべき**と判断し、今回は
+   着手しなかった。`rsa`クレート(Marvin Attack、Medium 5.9)も上流
+   未修正のため対処不能。`idna`(0.2.3)・`rkyv`(0.7.46)も
+   `cargo audit`が検出したが、深刻度・悪用可能性の評価まではこの
+   セッションでは行えていない。
+4. **`cargo audit`最終結果**: 10件→7件(`h2`・`quick-xml`2件を解消)。
+   `web`サブクレートは1件→0件(`h2`のみだったため)。
+- 次にすべきこと: (1) `mongodb`2.x→3.xへの移行を専用セッションで
+  計画・実施(破壊的変更の洗い出し、`aruaru-registry`クレートの
+  回帰テスト整備が前提)、(2) `idna`/`rkyv`の深刻度評価、(3) `rsa`の
+  上流修正状況を定期確認。
+
+## 設計方針: APIキー自動ライフサイクル管理 + REST→GraphQL/バイナリ
+プロトコルへの段階的移行(2026-08-29、open-english/RPoem連携経由の
+ユーザー指示、今後の全セッション共通方針として記録)
+
+**背景**: open-english側のセッションから「aruaru-dbとの連携を強化し、
+特にREST APIを不要にして。APIキーは自動発行・自動承認・自動破棄・
+自動削除で自動管理して」という指示を受けた。RPoem
+(`open-runo-router::keyring::KeyGuardian`)の実装済み設計を調査した
+結果、「APIキー不要」とは認証自体の廃止ではなく**人間がキーを手動で
+発行・管理する必要をゼロにすること**を意味すると確認した上で、
+本リポジトリに以下を実装した。
+
+### 1. APIキー自動ライフサイクル管理(実装済み)
+
+`crates/aruaru-server/src/keyring.rs`(新規、RPoemの`KeyGuardian`と
+**同じ設計思想を独立に再実装**——Cargo依存としては結合しない、この
+エコシステムの既存方針〈WunderGraph Cosmo/Poem/Tauriと同様〉を踏襲):
+- **自動発行**: `POST /v1/keys/self-issue`(認証不要)が`viewer`ロール・
+  既定24時間TTLのキーを即座に発行する。
+- **自動承認**: 「認証を要求せず即座に発行できる」こと自体が承認手続き
+  そのもの——人間の承認待ちキューは存在しない。
+- **自動破棄**: GraphQL `revokeKeys(owner: "...")` mutation で特定オーナー
+  の全キーを即座に失効(2026-08-29続き4でREST `POST /admin/keys/revoke`
+  は撤廃、GraphQLが唯一の経路)。
+- **自動削除**: 期限切れキーは`verify()`実行時に検知されその場で
+  レジストリから削除される(明示的なcronジョブ不要)。
+- 既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンとは**完全に後方互換**
+  (両方式を`check_admin_auth`が併存判定、どちらか一方が有効なら通過)。
+- 実機検証: 単体テスト5件(発行・失効・期限切れ自動削除等)に加え、
+  実サーバーを起動し実HTTP経由で「無認証で自己発行→発行したキーで
+  保護エンドポイントへアクセス成功→そのキーを失効→同じキーで
+  401」という一連の流れを確認済み。
+
+### 2. Raft/WALプロトコルのREST完全撤廃(実装済み)
+
+ユーザー指示「Raft/WALプロトコル系は一切REST APIを使用しないように。
+信頼できる代替が無ければRust+RPoem/関連リポジトリをフル動員して
+一から開発すること」への対応。
+
+**調査結果(日英Web検索)**: 実運用の分散合意システム(etcd・TiKV)は
+いずれもノード間RPCにREST/JSON-over-HTTPを使わず、gRPC(Protocol
+Buffersによるバイナリシリアライズ+HTTP/2)を使う。Protobufペイロード
+は同等のJSONより概ね3〜5倍小さく、パースは5〜10倍速いという報告が
+ある([TiKV公式](https://tikv.org/deep-dive/rpc/grpc/)、
+[etcd公式](https://etcd.io/docs/v3.4/learning/design-client/))。
+Raftのノード間通信は単一運用者が管理する信頼済みネットワーク内で
+完結するRPCであり、人間可読性より低レイテンシ・低オーバーヘッドが
+優先されるべきと判断した。
+
+**実装**: `crates/aruaru-dist/src/raft/binary_transport.rs`(新規)。
+tonic/gRPC等の外部フレームワークは導入せず(このエコシステムの
+一貫方針、RPoemの手書きgRPC Health Serviceが同種の前例)、生TCP上の
+長さプレフィックス付きバイナリフレーム(`bincode`のserde互換API)を
+自前実装した。`AppendEntries`・`RequestVote`(旧`HttpTransport`)・
+closed timestampのside transport(旧`HttpSideTransport`)の**両方**を
+この単一のバイナリポート(`--gql-port` + 100固定オフセット、
+`cluster::BINARY_RAFT_PORT_OFFSET`)へ統合し、REST/JSON-over-HTTPを
+一切経由しないようにした。認証は既存の`ARUARU_DB_ADMIN_TOKEN`を
+フレーム内に含め定数時間比較(TLS/mTLSは未実装、同一データセンター
+内の信頼済みネットワークを前提とする従来の`HttpTransport`と同水準の
+境界)。
+
+**正直な線引き**: `/admin/closed-timestamp/publish`(「いつ・誰に
+配布するか」を人間/運用ツールが指示する管理トリガー)自体はREST
+管理APIのまま残した——ここは制御プレーン(人間向け)であり、
+ユーザー指示が対象とするのは実際に発生するノード間の生データ転送
+(データプレーン)である、という区別に基づく。
+
+**実機検証**: 2プロセス(leader+learner)を実際に別ポートで起動し、
+leaderへのINSERTがバイナリポート(8402等)経由で実際にfollowerの
+QueryEngineへ複製されること、REST側の旧`/admin/raft/append`が
+もはや呼ばれていないこと(バイナリリスナーのログ・TCP接続一覧で
+確認)を実証。単体テスト3件(フレーム往復・実TCP経由E2E・トークン
+不一致拒否)も全green。ワークスペース全体`cargo test`でリグレッション
+無し(既存192件超、全green)。
+
+### 3. `/admin/*`のREST→GraphQL段階的移行(第一歩のみ実装、方針を確立)
+
+**深い調査(日英、Google/GitHub、実装事例・論文)の結果**: 「即座に
+REST APIを完全撤廃する」ことは2026年時点の実務における標準パターン
+**ではない**、と判明した。
+- Shopifyは実際にREST Admin APIを廃止方針としているが、新機能は
+  GraphQL限定で提供しつつ既存REST機能は年次の廃止波(sunset wave)で
+  段階的に縮小している([Shopify Admin API](https://shopify.dev/docs/api/admin-graphql/2026-04))。
+- 日本の資産運用相談サービス「マネイロ」(運営: 株式会社モニクル
+  フィナンシャル、当時OneMile Partners)は「新規APIはGraphQL、改修
+  機会のある既存APIは改修時にGraphQL化、それ以外は段階的」という
+  **9ヶ月がかりの段階移行**で全REST APIを置き換えた実例がある
+  ([がぶちゃんの日記](https://gabu.hatenablog.com/entry/2023/08/02/130000))。
+  **【2026-08-29訂正】この実例をこれまで「日本のJX通信社」と誤記して
+  いたことを再調査で発見・訂正した(WebFetchで元記事本文を確認した
+  ところ、実際は資産運用アドバイスサービス「moneiro」に関する記事
+  だった)——JX通信社は無関係。事実確認を怠ったまま社名を記録していた
+  ことを正直に開示する。**
+- 「複数ゲートウェイ・複数プロトコルを横断する統一コントロールプレーン」
+  という、REST/GraphQL/gRPC等を併存させたまま管理する設計が2026年の
+  実務でも主流であり、「完全REST撤廃」自体が支配的パターンではない。
+
+**この調査結果に基づく本リポジトリの方針(今後のセッションが従うべき
+既定方針)**: `/admin/*`のREST操作を、根拠のない「一括撤廃」の主張で
+終わらせず、**実際に真のデータソースへ接続してから**段階的にGraphQL
+実装を充実させ、**十分検証できたものから**REST側を縮小していく。
+
+**発見した重大な事実(正直な開示)**: 着手前に`aruaru-graphql/src/
+admin_resolvers.rs`を確認したところ、`cluster_status`・
+`parallel_config`・`parallel_jobs`・`federated_sources`・
+`backup_schedule`等のGraphQL側resolverは、**REST側の実データには
+一切接続されておらず、固定値や`Ok(vec![])`のようなスタブを返すだけ**
+だったと判明した(2026-08-01のHANDOFFは「GraphQL経由の管理操作にも
+認証を適用した」と記録していたが、これは認証ミドルウェアの追加のみを
+指しており、resolverの中身が本物のデータを返すことまでは検証・
+保証していなかった——ドキュメントの記述と実態が食い違っていた
+このエコシステムで繰り返し見つかるパターンの新たな実例)。
+
+**今回実装した第一歩(`cluster_status`)**: `aruaru-dist::shard::
+topology::ClusterTopology::status_snapshot()`という**REST・GraphQL
+共通の1つの実装**を新設し、REST `/admin/cluster`ハンドラ
+(`admin.rs::cluster_status`)とGraphQL `clusterStatus` resolverの
+**両方**がこれを呼ぶように書き換えた。`AdminState.topology`を
+`Arc<Mutex<..>>`化し、`AdminCtx.topology`として同一インスタンスを
+GraphQL側にも共有することで、今後REST側でトポロジが変化すれば
+(ノード追加・Range分割等)GraphQL側にも即座に反映される。これで
+GraphQL `clusterStatus`は**もう固定値のスタブではなく本物のデータ**
+を返す。
+
+**まだ未着手のまま正直に残す範囲(次回以降の段階的着手対象)**:
+`parallel_config`/`parallel_jobs`/`federated_sources`/
+`backup_schedule`(依然スタブ、REST側の実データへの接続が必要)、
+`multi-raft`(split/merge/scatter-query)・`sharded-store`・
+`closed-timestamp`(status/register/advance/plan)・`wal-service`・
+`object-table`・`ephemeral-query`・`registry`(crawl/test-connection)
+・`keys`(revoke/status)は、GraphQL側に対応するresolver自体がまだ
+存在しない(2026-08-21〜24に新設された機能はREST限定で実装された
+ため)。これらを1機能ずつ「REST側の実装をGraphQLへ移し、実際に
+実HTTPで動作確認してからREST側の縮小を検討する」という同じ手順で
+段階的に進めること——スタブを量産して「GraphQL対応済み」と見せかける
+ことは絶対に避けること。
+
+**検証**: `cargo test --workspace`全green(既存テストにリグレッション
+無し、`AdminCtx`の新フィールド追加に伴うテスト側の構築箇所修正1件を
+含む)。実サーバーでの`clusterStatus`クエリの実HTTP確認は次回セッション
+で実施すること(このセッションではコンパイル・単体テストの確認までに
+留まった、正直な開示)。
+
+- 次にすべきこと: (1) 上記「まだ未着手」の各機能を1つずつ
+  GraphQL化(REST実装への接続→実HTTP確認→REST縮小の検討、の順で)、
+  (2) `clusterStatus`の実サーバー実HTTP確認、(3) この段階的移行方針
+  自体を、他のRESTを持つ関連リポジトリ(open-easy-web・open-web-server
+  等)へも横展開するか検討。
+
+## HANDOFF追記(2026-08-29続き) REST→GraphQL段階移行の第二歩
+(`backupSchedule`・`federatedSources`を実データへ接続)+
+RPoem/WunderGraph Cosmoとの連携性・必要性の再調査
+
+**背景**: 直前のエントリで「1機能ずつ、REST実装への接続→実HTTP確認→
+REST縮小検討、の順で進めること」と明記した通りに、`backup_schedule`/
+`set_backup_schedule`(バックアップ定期実行スケジュール)と
+`federated_sources`/`register_federated_source`/`drop_federated_source`
+(外部DBフェデレーションソース登録)の2グループを今回接続した。
+
+**実装**: `cluster_status`(前回)と全く同じ設計パターンを踏襲——
+REST側(`AdminState`)とGraphQL側(`AdminCtx`)が**同一の
+`Arc<parking_lot::Mutex<..>>`インスタンス**を参照する。新規
+`crates/aruaru-dist/src/admin_shared.rs`に`BackupScheduleState`/
+`FederatedSourceEntry`(両者から使われる共有データ型、`aruaru-server`・
+`aruaru-graphql`はいずれも`aruaru-dist`に依存できるため、循環依存を
+避けつつ状態共有できる)を新設。`AdminState`の`schedule`/`federation`
+フィールドをこの共有型の`Arc<Mutex<..>>`へ変更し、`schedule_handle()`/
+`federation_handle()`アクセサ(`topology_handle()`と同じパターン)を
+追加。あわせて、REST側に元々`POST /admin/backup/schedule`しか無く
+`GET`が存在しなかった非対称性(設定はできるが取得できない)も発見・
+是正し`GET /admin/backup/schedule`を新設した。
+
+GraphQL側は`backup_schedule`(旧: 常に`None`固定)・
+`set_backup_schedule`(旧: 入力をそのまま返すだけで永続化しない)・
+`federated_sources`(旧: 常に空配列固定)・`register_federated_source`
+(旧: 入力をそのまま返すだけで永続化しない、重複登録チェックも無し)・
+`drop_federated_source`(旧: 何もせず成功メッセージだけ返す)を、共有
+`Arc<Mutex<..>>`への実際の読み書きへ差し替えた。`register_federated_source`
+はREST側`register_federation`と同じ「同名が既に存在すれば拒否」ルール
+も移植した(従来のGraphQL版には無かった)。
+
+**意図的に見送った箇所(誇張しないための正直な記録)**: `parallel_config`/
+`set_parallel_config`/`parallel_jobs`は今回も未接続のまま残した。
+理由はコスト回避ではなく**スキーマ形状そのものが非互換**なため——
+REST側の実`ParallelConfig`(`max_parallelism`/`worker_threads_per_node`
+/`enable_parallel_scan`/`enable_parallel_aggregate`/
+`enable_shuffle_join`/`shuffle_partitions`/`broadcast_threshold_mb`の
+7フィールド)と、既存のGraphQLスキーマ`ParallelConfigGql`
+(`enabled`/`max_workers`/`chunk_size`/`strategy`の4フィールド)は
+対応するフィールドが実質1つも無い。無理に`max_workers =
+max_parallelism`のような意味の薄い変換を当てはめると、「実データに
+接続した」と称しながら実際には無関係な値を表示するという、
+かえって悪質な不整合を生む。この箇所を本当に接続するには**GraphQL
+スキーマ自体の破壊的変更**が必要——今回のスコープ(既存スキーマを
+壊さずに済む範囲での段階移行)からは意図的に除外し、その理由をコード
+コメントにも明記した。`parallel_jobs`はREST側`list_jobs`自体が
+「組み込み単一ノードでは長時間ジョブの常駐管理は未実装」として常に
+`{"jobs": []}`を返すだけであり、GraphQL側の空配列はスタブとの乖離
+ではなく**REST側の実際の制約と一致した結果**であることも確認した。
+
+**検証(実測)**: `cargo test -p aruaru-graphql`で新規2件
+(`set_backup_schedule_persists_and_backup_schedule_reads_it_back`
+——書き込み前は`null`、書き込み後は共有`Arc<Mutex<..>>`とGraphQL
+再クエリの両方に反映されることを確認、
+`federated_source_register_list_and_drop_round_trip_through_shared_state`
+——登録→一覧反映→同名二重登録の拒否→削除→一覧から消える、の一連を
+共有状態への直接アクセスで検証)を含め計8件全green(既存6件に
+リグレッション無し)。`cargo build --workspace`/`cargo test
+--workspace`も実行し、ワークスペース全体でのリグレッション有無を
+確認した(結果は本エントリ末尾に追記)。
+
+**RPoem/WunderGraph Cosmoとの連携性・必要性の再調査(ユーザー指示)**:
+日英でWeb検索を行い、以下を確認した。
+- WunderGraph Cosmo**本体(Router・Schema Registry・Studio・CLI・
+  メトリクス/トレーシング)はApache 2.0ライセンスのOSSであり、
+  セルフホストも可能**([WunderGraph公式](https://wundergraph.com/)、
+  [GitHub: wundergraph/cosmo](https://github.com/wundergraph/cosmo))。
+  **有料(Enterprise)部分は、SSO(OpenID Connect)+SCIM(チーム
+  メンバーシップに応じた権限自動追従)・専有クラウド(Dedicated Cloud、
+  SOC 2認証・カスタムリリースサイクル)に限定される**
+  ([Cosmo Enterprise公式](https://cosmo-docs.wundergraph.com/enterprise)、
+  [WunderGraph SSO/SCIMブログ](https://wundergraph.com/blog/sso-openid-connect-system-for-cross-domain-identity-management))。
+  これは従来このリポジトリ・RPoemのCLAUDE.mdが記していた理解
+  (「Cosmo有料版の機能をOSS Rustで再実装する」)と**部分的に不正確**
+  だった点を訂正する——正しくは「Cosmo**本体**は元々OSS、
+  RPoemが独自に再実装すべき価値があるのは**Enterprise限定機能
+  (SCIM/SSO)のみ**」ということになる。RPoem側は既に
+  `open-runo-scim`(SCIM 2.0のOSS実装)を持っており、この訂正された
+  理解と実際に合致していることを確認した——**設計方針の変更は不要**、
+  記述の正確性を高める訂正のみ。
+- aruaru-db側の「REST API不要」というユーザー要求は、Cosmoの
+  VersionlessAPI/GraphQL Federationという**コンセプト**を参考にする
+  という既存方針の延長にあり、Cosmo自体(パッケージ)への直接依存は
+  元から無い(このリポジトリはGraphQLを`async-graphql`で自前実装)。
+  今回の調査で新たにCosmoへの直接依存が必要になる発見は無かった。
+- **open-cuda/open-directxとの連携性・必要性の再確認**: 両リポジトリの
+  `CLAUDE.md`を実際に`grep`したところ「REST API」「APIキー」への言及が
+  一件も無いことを確認した。両者はGPU計算ライブラリ(SIMD/CUDA/DirectX
+  抽象化)であり、そもそもHTTPサーバー・APIキー認証面を一切持たない
+  ——今回のREST撤廃/APIキー自動管理というテーマは、この2リポジトリには
+  **適用対象が構造的に存在しない**(既存の「open-cuda + aruaru-llm SET」
+  というAI連携の位置づけ〈open-raid-z/CLAUDE.md参照〉から変更なし)。
+  open-web-server/open-raid-zについては、この2リポジトリ自体が既に
+  RPoemの`KeyGuardian`設計を参照実装として認識している(open-raid-z
+  CLAUDE.mdの「分身の術」節参照)ため、今回新たに調査すべき未知の
+  連携ギャップは見つからなかった——結論として、今回のAPIキー自動管理・
+  REST撤廃方針の実装対象は引き続き「HTTP管理APIを実際に持つ
+  リポジトリ(aruaru-db・RPoem・open-web-server・open-easy-web等)」に
+  限定され、GPU計算ライブラリ(open-cuda/open-directx)は対象外という
+  既存の理解が正しいことを再確認した。
+
+- 次にすべきこと: (1) `multi-raft`(split/merge/scatter-query)・
+  `sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
+  `ephemeral-query`・`registry`(crawl/test-connection)・`keys`
+  (revoke/status)のGraphQL化(前回エントリから継続、未着手のまま)、
+  (2) `parallel_config`をGraphQL化する場合は、まずスキーマの破壊的
+  変更(`ParallelConfigGql`をREST実体に合わせて再設計)の是非をユーザー
+  へ確認してから着手すること(無理な変換は行わない)、(3) RPoem/
+  open-raid-zのCLAUDE.mdにある「Cosmo有料版機能の再実装」という記述の
+  精度向上(「Cosmo本体はOSS、再実装対象はEnterprise限定のSCIM/SSOの
+  み」への訂正)を横展開するか検討。
+
+## HANDOFF追記(2026-08-29続き2) REST→GraphQL段階移行の第三歩
+(`keys`=`keyStatus`/`revokeKeys`を実データへ接続)+最重要事項を
+ファイル冒頭へ固定
+
+**実装**: APIキー自動ライフサイクル管理(`KeyGuardian`、2026-08-29に
+`aruaru-server`内で新設)を、REST(`AdminState`)とGraphQL(`AdminCtx`)
+両方が同一インスタンスを共有できるよう、両クレートが依存できる
+`aruaru-dist`へ`git mv`で移設した(`admin_shared.rs`/`ClusterTopology`と
+同じ理由・同じパターン)。`aruaru-server`側は`aruaru_dist::keyring::
+KeyGuardian`をそのまま再利用するよう全参照を書き換え(ロジック自体は
+無変更)。GraphQL側に新規`keyStatus`クエリ・`revokeKeys`ミューテーション
+を追加し、REST `GET /admin/keys/status`・`POST /admin/keys/revoke`・
+`POST /v1/keys/self-issue`と**同一の`KeyGuardian`インスタンス**を
+参照するよう`main.rs`で配線した(従来GraphQL側にはこの操作自体が
+存在しなかった)。
+
+**検証(実測)**: `cargo build --workspace`成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test --workspace`
+全19テストバイナリで`test result: ok`、失敗0件
+(`aruaru-graphql`: 6→9テスト、`key_status_and_revoke_keys_operate_on_
+the_shared_key_guardian`——発行前0件→REST側と同じ`KeyGuardian`へ直接
+`issue`して2件→`revokeKeys`で1件失効→失効後も`count()`は2のまま
+〈REST側`keyring_status`と同じ「失効フラグのみ、レコード削除ではない」
+挙動〉を実データで確認。`aruaru-dist`: keyring.rs移設分5テスト追加、
+`aruaru-server`: keyring.rs移設によりテスト数が8→3〈self_update系のみ〉
+に変化〈リグレッションではなく移設先での実行に切り替わっただけ〉)。
+
+**最重要事項をファイル冒頭へ固定(ユーザー指示)**: 「aruaru-dbは
+RPoemとSET(対)で使うことで初めてREST API不要・WunderGraph Cosmo
+有料版互換という価値が成立する」「REST APIの代替をただ闇雲に作っても
+意味が無い」という戒めを、本ファイルの一番上(冒頭バナー群のさらに前)
+へ固定した。あわせてRPoem側`CLAUDE.md`にも同内容の同期エントリを
+ファイル冒頭へ追加した(正本はこちら、RPoem側は参照エントリ)。
+以後、何かをREST→GraphQL/バイナリへ移行する提案・実装をする前に、
+必ずこの冒頭エントリを再確認すること。
+
+- 次にすべきこと: (1) `multi-raft`(split/merge/scatter-query)・
+  `sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
+  `ephemeral-query`・`registry`(crawl/test-connection、**注意**:
+  `crawl_registry`/`test_registry_connection`はGraphQL側に既に実装
+  済みで実データ接続もされている——「未着手」と誤解しないこと、
+  今回の再確認で判明)のうち、まだGraphQL側に対応するresolver自体が
+  無いもの(`multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`object-table`/`ephemeral-query`)を1つずつ、必ず
+  「これはaruaru-db+RPoem SETとしての価値を強化するか」を自問した
+  上で着手すること、(2) `parallel_config`のスキーマ再設計の是非を
+  ユーザーへ確認、(3) RPoem/open-raid-zのCosmo記述精度向上の横展開。
+
+## HANDOFF追記(2026-08-29続き3) REST→GraphQL段階移行の第四歩
+(`object-table`=**初の「RESTルート完全撤廃」**)
+
+**背景(ユーザー指摘)**: 第1〜3歩(`clusterStatus`/`backupSchedule`/
+`keyStatus`)は「GraphQLを実データ化しただけで、対応するRESTルートは
+消していない」——つまりRESTは1本も不要になっていなかった。ユーザーの
+「REST APIを完全に不要にするのですよ、大丈夫ですか?」を受け、
+`object-table`を「GraphQLでパリティ達成 → `admin.rs`から該当ルートを
+削除」まで通す初の雛形とした。時間旅行(スナップショット連鎖)は
+VersionlessAPIの核なので、SET価値の直接強化と判断(闇雲な代替ではない)。
+
+**実装**:
+- `crates/aruaru-graphql/src/admin_resolvers.rs`: `objectTable` query
+  (status)、`objectTableCommit`/`objectTablePrune` mutation を新設。
+  REST版(`object_table_status`/`_commit`/`_prune`)と同じ戻り値・
+  同じバリデーション文言(`op is required ...` 等)を踏襲。bloom filter
+  引数はGraphQLで`BTreeMap`が表せないため`[{column, keys}]`の
+  `ObjectBlockBloomInput`リストへ変換。
+- `crates/aruaru-graphql/src/admin_types.rs`: `ObjectTableStatusGql`/
+  `ObjectTableSnapshotGql`/`ObjectTableCommitResultGql`/
+  `ObjectTablePruneResultGql`。
+- `crates/aruaru-server/src/admin.rs`: **`.at("/object-table" ...)`・
+  `/commit`・`/prune`の3ルート、`object_table_status`/`_commit`/
+  `_prune`の3ハンドラ、`ObjectBlockStat`/`ObjectBlockRequest`/
+  `ObjectTableCommitRequest`/`ObjectTablePruneRequest`の4構造体を削除**。
+  `object_table`フィールドと新設`object_table_handle()`だけ残す
+  (GraphQL `AdminCtx.object_table`へ注入する唯一の経路)。
+- `crates/aruaru-server/src/main.rs`: `admin_state.object_table_handle()`
+  をGraphQLへ配線。
+
+**検証(実測)**: `cargo test -p aruaru-graphql -p aruaru-server`
+失敗0件(`aruaru-graphql` 10テスト、新規
+`object_table_commit_prune_and_status_are_graphql_only`——コミット前は
+履歴空 → `objectTableCommit`×2 → `objectTable`で履歴2件・current.prev
+連鎖を確認 → `objectTablePrune(op:"lt", value:50)`でrange述語の
+segment読み飛ばし(keptBlocks=1, skippedSegments=1)を確認 →
+`op`欠落時のエラー文言も確認)。既存警告のみ(`build_cluster`/
+`propose_commit`/`ephemeral_pod.rs`の`super::*`、いずれも無関係)。
+
+**RPoem側**: grep確認済み——RPoemはaruaru-dbの`/admin/object-table`を
+参照していない(RPoem自身の`/admin/*`はappserver-tenants等の別物)。
+よってこの撤廃でRPoemは無変更。連携強化の実体は「時間旅行が
+RESTホップ無しでfederation GraphQLサーフェスに載る」こと。
+
+- 次にすべきこと: `multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`ephemeral-query`に、`object-table`と同じ4手順
+  (GraphQL query/mutation新設 → `AdminCtx`へ`Arc`注入 → `admin.rs`から
+  RESTルート削除 → test)を適用。加えて第1〜3歩(`clusterStatus`/
+  `backupSchedule`/`keyStatus`)も、パリティは済んでいるので
+  `admin.rs`からのルート削除だけ実施すればREST撤廃が完了する。
+  `parallel_config`はスキーマ非互換のため引き続き保留(ユーザー確認前)。
+
+## HANDOFF追記(2026-08-29続き4) REST→GraphQL段階移行の第五歩
+(`keys`=2つ目の「RESTルート完全撤廃」+ 他エンドポイント撤廃可否の調査)
+
+**実装**: `object-table`(続き3)と同じ雛形を`keys`へ適用。
+- `crates/aruaru-server/src/admin.rs`: `.at("/keys/revoke" ...)`・
+  `.at("/keys/status" ...)`の2ルート、`revoke_key`/`keyring_status`の
+  2ハンドラ、`RevokeKeyRequest`構造体を削除。参照・破棄はGraphQL
+  `keyStatus` query / `revokeKeys` mutation(続き2で新設済み、パリティ
+  検証済み)が唯一の経路になった。認証(`check_admin_auth`が
+  `state.keyring`で発行済みキーを検証)は無変更。
+- `crates/aruaru-server/src/main.rs`: 自己発行APIの`note_ja`と
+  コメントの`POST /admin/keys/revoke`表記を`revokeKeys` mutationへ更新。
+  `/v1/keys/self-issue`(認証不要トップレベル、GraphQL等価無し)は存続。
+- `CLAUDE.md`: APIキー管理節の「自動破棄」を更新。
+
+**検証(実測)**: `cargo test -p aruaru-graphql -p aruaru-server`
+失敗0件(`aruaru-graphql` 10・`aruaru-server` 3+1ignored、続き3から
+テスト数不変=リグレッション無し)。既存警告のみ
+(`ephemeral_pod.rs`の`super::*`、`build_cluster`/`propose_commit`、無関係)。
+
+**撤廃可否のクライアント調査(重要)**: `clusterStatus`/`backupSchedule`/
+`federatedSources`もGraphQLパリティ済みだが、**`admin/src-tauri/src/
+main.rs`(Tauri管理アプリ)・`android/app/src/main/java/tokyo/runo/
+aruarudb/MainActivity.kt`・`web/`(リバースプロキシ)が今もREST
+`/admin/cluster`・`/admin/backup/schedule`・`/admin/federation*`を
+叩いている**ことをgrepで確認。これらのRESTルート削除は、先に
+Tauri/Android/webクライアントをGraphQLへ移行してから行う必要がある
+(この移行はユーザーに規模を共有してから着手)。`object-table`と`keys`が
+安全に撤廃できたのは、grepで他クライアントの参照が皆無だったため。
+
+- 次にすべきこと: (1) `multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`ephemeral-query`のうち1つを、**着手前にgrepで
+  Tauri/Android/webの参照が無いことを確認した上で**、object-table雛形の
+  5手順で撤廃、(2) Tauri/Android/webクライアントのGraphQL移行計画を
+  ユーザーへ提示(これが済めば`cluster`/`backup/schedule`/`federation`も
+  撤廃可能)、(3) `parallel_config`はスキーマ非互換のため引き続き保留。
+
+## HANDOFF追記(2026-08-29続き5) 方針転換: 管理面の抜本再設計へ
+
+**経緯**: 続き3(`object-table`)・続き4(`keys`)で「REST ルート完全撤廃」の
+雛形を作ったが、ユーザーから「削るだけ／GraphQL mutation に置換するだけでは
+抜本的解決になっていない。設計思想・設計哲学から一から再設計・再開発して」
+との指示。WunderGraph Cosmo の一次資料(router configuration / overview /
+enterprise)を再調査した結果:
+
+- Cosmo のデータプレーン(Router)が公開する HTTP は `/graphql`・`/health*`・
+  `/metrics`・Playground のみ。**管理用 REST は存在しない**。
+- 運用設定 = 静的 YAML 1枚 + 動的 execution config(CDN/コントロールプレーン
+  からポーリング取得)+ ホットリロード(SIGHUP / watch_config)。
+- 管理アクションは別コンポーネント(Control Plane / Platform API)を
+  `wgc` CLI・Studio が叩く。データプレーンには載せない。
+
+→ aruaru-db の `/admin/*`(約40本)を「実行時ミューテーションで設定管理」
+している構造そのものがアンチパターン。プロトコルを REST→GraphQL に
+変えても本質は変わらない。
+
+**成果物**: 正本の設計文書 **`docs/CONTROL_PLANE_REDESIGN.md`** を新設。
+設計哲学(8原則)・目標 HTTP 面・`/admin/*` 全エンドポイントの 4バケツ
+仕分け(B1 宣言的設定 / B2 一度きりのアクション / B3 観測リード /
+B4 ノード間RPC)・`aruaru.yaml` スキーマ案・ホットリロード機構・
+クライアント(Tauri/Android/web)移行計画・フェーズ P0〜P6・
+影響リポジトリ・却下案 を記載。
+
+**ユーザー選択**: 「全バケツを一気に再設計・再実装(複数セッション)」。
+**P0(設計確定)は完了**。次は **P1 = 宣言的設定基盤**
+(`crates/aruaru-server/src/config/`: load + watch + reconcile、
+`--config` フラグ、新規依存 `notify` + YAML パーサ)。
+
+**parallel_config**: 旧「保留」を解消。ユーザー判断で「GraphQL の4
+フィールド(enabled/max_workers/chunk_size/strategy)を正とし REST を
+そこへ寄せる」に決定 → 再設計では B1 として `aruaru.yaml: query.parallel`
+へ(P2)。
+
+**この回のコード変更**: 無し(設計文書 + CLAUDE.md のみ)。続き5の
+着手途中で作った `aruaru-dist::admin_shared::ParallelConfigState` 等の
+編集は、再設計の方向と合わないため `git checkout` で破棄済み。
+
+## HANDOFF追記(2026-08-29続き6) 再設計 P1: 宣言的設定基盤
+
+**正本**: `docs/CONTROL_PLANE_REDESIGN.md`(続き5 で新設)。P0(設計確定)に
+続き、**P1(宣言的設定基盤)を実装・完了**。
+
+**新設ファイル**:
+- `crates/aruaru-server/src/config/mod.rs` — `AruaruConfig`(serde、全
+  フィールド `#[serde(default)]`、`deny_unknown_fields`)、`load(path)`
+  (`${VAR}` 環境変数展開 → YAML 解析)、`expand_env`。サブ構造は
+  `docs/CONTROL_PLANE_REDESIGN.md` §5 の `aruaru.yaml` スキーマに対応。
+  `query.parallel` は **GraphQL と同じ4フィールド**
+  (enabled/max_workers/chunk_size/strategy)で定義。
+- `crates/aruaru-server/src/config/reconcile.rs` — `reconcile(new,
+  previous, &AdminState) -> ReconcileReport`。動的セクションの差分を
+  `AdminState` の共有ハンドルへ**冪等**適用。P1 の対象は
+  `backup.schedule`(`schedule_handle()`)と `federation.sources`
+  (`federation_handle()`)。静的セクション(server/raft)は差分検知で
+  「要再起動」を warn + `restart_required` へ記録するのみ。
+- `crates/aruaru-server/src/config/watch.rs` — `spawn_config_watcher`。
+  WunderGraph Cosmo の `watch_config` と同じ **mtime ポーリング**
+  (既定 2s)＋ `cfg(unix)` の `SIGHUP` でホットリロード。YAML 解析
+  エラー時は error ログを出して**直前の設定を維持**。
+- `aruaru.example.yaml`(リポジトリ直下)— 注釈付きサンプル。
+
+**変更**:
+- `crates/aruaru-server/src/main.rs` — `mod config;`、`--config <path>`
+  フラグ追加。指定時のみ起動時ロード + 初回 reconcile + 監視タスク起動。
+  未指定なら従来どおり(後方互換)。
+- `crates/aruaru-server/Cargo.toml` — `serde_norway = "0.9"` を追加
+  (`serde_yaml`/`serde_yml` は非推奨のため後継を選択)。`notify` は
+  不採用(自前 mtime ポーリングで依存を増やさない)。
+
+**検証**: `cargo test -p aruaru-server` 失敗0。config 系 新規7テスト
+(env 展開 / 空 YAML=既定 / 部分 YAML / 未知キー拒否 / schedule+federation
+適用の冪等性 / YAML から source 削除 → state からも削除 / 静的差分の
+restart_required)。既存警告のみ(ephemeral_pod の `super::*` 等、無関係)。
+
+**次(P2)**: `query.parallel`(4フィールド)/ `follower_read.target_lag_ms`
+/ `wal` / `sharded_store` を reconcile へ接続。`AdminState.parallel` の
+7フィールド独自型を4フィールド共有型へ置換。`/admin/parallel` 等の
+REST ルートと GraphQL `setParallelConfig` スタブを削除。`admin/src-tauri`
+の設定タブを `aruaru.yaml` 編集へ転換。
+
+## HANDOFF追記(2026-08-29続き7) 再設計 P2: B1 の移送(主要部)
+
+正本: `docs/CONTROL_PLANE_REDESIGN.md`。P1(設定基盤)に続き **P2(B1 =
+宣言的設定の移送)の主要部を実装**。
+
+**(1) `query.parallel` の4フィールド化**
+- `aruaru_dist::admin_shared::ParallelConfigState`(enabled/max_workers/
+  chunk_size/strategy)を新設。`AdminState.parallel` の旧7フィールド独自
+  `ParallelConfig`(max_parallelism 等)を廃し、この共有型へ統一。
+  `parallel_handle()` アクセサ追加。
+- `config::reconcile` に `query.parallel` を接続(完全ホットリロード、冪等)。
+- GraphQL: `parallelConfig` query を固定値スタブ → `AdminState.parallel` の
+  実効値を返す形へ。`setParallelConfig` mutation と `ParallelConfigInput`
+  を撤廃(設定は宣言的 aruaru.yaml が正本、実行時ミューテーション廃止)。
+  `AdminCtx.parallel` フィールド + main.rs 配線 + test helper 更新。
+- REST: `GET/POST /admin/parallel` ルートと `get_parallel`/`set_parallel`
+  ハンドラを削除。`explain_distributed` ハンドラを4フィールドへ移植
+  (shuffle パーティション数は `max_workers*8` を既定ヒューリスティックに)。
+  `/admin/parallel/explain`・`/admin/parallel/jobs` は P3 まで残置(理由:
+  GraphQL `explainDistributed`/`parallelJobs` が現状スタブで実ロジック
+  移植が必要)。
+- Tauri(`admin/src-tauri/src/main.rs`): `ParallelConfig` を4フィールド化。
+  `get_parallel_config` を GraphQL `parallelConfig` query へ。
+  `set_parallel_config` は「aruaru.yaml で管理」の案内を返す形へ。
+  ※ Tauri は独立パッケージ(tauri v2、ワークスペース外)でこの環境では
+  ビルド検証不可——ソース編集のみ。
+
+**(2) `follower_read.target_lag_ms` の完全ホットリロード化**
+- `crates/aruaru-dist/src/closed_ts.rs`: `ClosedTimestampCoordinator` と
+  `ClosedTimestampTracker` の `target_lag_nanos: u64` を
+  `Arc<AtomicU64>` 共有へ変更。`Coordinator::set_target_lag_nanos()` /
+  `target_lag_nanos()`、`Tracker::with_shared_lag()` を追加。
+  `register_range` が同一 Arc を全 tracker へ配る → 一度の store で
+  既存・新規どちらの tracker にも即反映。`new(u64)` 互換は維持
+  (内部で Arc 化。既存3テスト無変更で通過)。
+- `config::reconcile` に接続。
+
+**(3) `wal` / `sharded_store` は静的扱いと確定**
+- safekeeper 台数・シャード数は構築時固定で稼働中の再構成は進行中状態を
+  失う。reconcile は差分検知で `restart_required` を報告するのみ
+  (Cosmo の静的セクションと同じ扱い)。`aruaru.example.yaml` にコメント。
+
+**(4) 調査(ユーザー指示)**: 「CockroachDB × Snowflake ハイブリッド変種の
+実在DB」を英日で Google/GitHub 調査 → `docs/CONTROL_PLANE_REDESIGN.md`
+**付録 A**。代表格は TiDB/TiKV+TiFlash(Raft 強整合 OLTP + Raft-Learner
+列指向レプリカ、DeltaTree、読み取り時 Raft index + MVCC で SI 検証)。
+aruaru-db が既に持つもの/未取り込みで価値があるもの(Learner 列レプリカ、
+SI 読み取り検証、DeltaTree 型 delta 層)を整理。P5(コントロールプレーン)
+で execution-config の配信内容として接点。
+
+**検証**: `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+失敗0(aruaru-dist 72+1ignored、aruaru-graphql 11、aruaru-server config系
++3・GraphQL +1)。既存警告のみ。
+
+**次**: P2 残り(`disaster_backup.email` reconcile 接続、explain/jobs の
+GraphQL 実データ化 → REST 撤廃、Tauri 設定タブの aruaru.yaml 編集 UI 化)、
+その後 P3。
+
+## HANDOFF追記(2026-08-29続き8) 再設計 P2残り/P3: parallel/explain・jobs と self-issue の REST 撤廃
+
+正本: `docs/CONTROL_PLANE_REDESIGN.md`(§2 新・設計哲学12か条、§3 REST 完全撤廃の
+厳命、付録 A=TiDB/TiFlash 調査、付録 B=REST 撤廃を可能にする Cosmo の技術)。
+
+**(a) `/admin/parallel/explain`・`/admin/parallel/jobs` を完全撤廃**
+- GraphQL `explainDistributed` query: 固定値スタブを廃止し、旧 REST
+  `explain_distributed` の実ロジック(SQL 分類 → `AdminState.parallel` の
+  実効値 + 推定行数から ParallelScan/ShuffleExchange/HashAggregate/Gather の
+  ステップ列を組む)を移植。**読み取りなので `AdminMutation` → `AdminQuery`
+  へ移設**(最初 Mutation に置いてスキーマエラー→テスト7件が poison cascade で
+  失敗 → Query へ移して解決)。
+- `parallelJobs` query は既存のまま(単一ノードは常駐ジョブ管理を持たず `[]`)。
+- `admin.rs`: `.at("/parallel/explain")`・`.at("/parallel/jobs")` ルートと
+  `explain_distributed`/`list_jobs` ハンドラ削除。未使用になった
+  `use aruaru_query::parser::{self, Statement};` も削除。
+- Tauri `admin/src-tauri/src/main.rs`: `explain_distributed`/`list_parallel_jobs`
+  コマンドを GraphQL query 呼び出しへ書き換え。
+- → **`/admin/parallel*` は 1 本も残っていない**。
+
+**(b) `/v1/keys/self-issue` REST 撤廃 → GraphQL `selfIssueKey` mutation**
+- `crates/aruaru-graphql/src/lib.rs`: `VcsMutation` に `self_issue_key`
+  リゾルバ(**認証ガード無し** = SPIFFE 哲学「即発行できること自体が承認」)。
+  `SelfIssuedKeyGql { key, role, expires_in_hours }`。`build_schema` が
+  `AdminCtx.keyring` と同一 `KeyGuardian` を `.data()` で schema へ注入。
+- `crates/aruaru-server/src/main.rs`: `/v1/keys/self-issue` ルート・
+  `self_issue_key` ハンドラ・`keyring_for_self_issue` を削除。
+  未使用の `post`/`Data` インポートも整理。
+- 他クライアント参照は grep 済みで皆無(ドキュメントのみ)。
+
+**(c) `disaster_backup.email` — config スキーマのみ先行、reconcile は保留**
+- `config::DisasterBackupEmail` を `open_raid_z_core::EmailBackupTargetConfig`
+  と同じ7フィールド(smtp_host/port/username/password_env/from/to/
+  allow_plaintext_for_testing)へ拡張。`aruaru.example.yaml` も更新。
+  `#[allow(dead_code)]` を付与(P3 の feature ゲート付き reconcile が消費予定)。
+- reconcile 本体は `feature = "disaster_email_backup"` ゲート +
+  `replicator.set_disaster_email_backup` 注入の要否判断 + feature ゲート付き
+  テストが必要なため**別スライス**として次回。
+
+**検証**: `cargo test -p aruaru-graphql -p aruaru-server` 失敗0
+(GraphQL 新規3: `self_issue_key_mutation_works_without_admin_token` /
+`explain_distributed_reflects_parallel_config_and_query_kind` /
+既存 `parallel_config_query_returns_shared_state_not_a_stub`)。
+`cargo build -p aruaru-server` 既存2警告のみ。
+
+**次(P3 本体)**: `ephemeral-query`/`multi-raft`/`sharded-store`/
+`closed-timestamp`/`wal-service` の GraphQL 化 → `/admin/*` 該当ルート削除。
+`disaster_backup` reconcile(feature ゲート)。着手前に grep で
+Tauri/Android/web の該当 REST 参照確認。
+
+## HANDOFF追記(2026-08-29続き9) セッション終了チェックポイント + ドキュメント整合
+
+ユーザー指示: 「上記メモを開発途中記録として記録して、README/CLAUDE/PORTING を
+日本語と英語で編集して push・commit して停止、次回別アカウントでも復活できる
+よう復活用メッセージも書いて停止」。
+
+**このセッションの成果(全て push 済み)**:
+- P0: `docs/CONTROL_PLANE_REDESIGN.md` 新設(設計哲学12か条・4バケツ仕分け・
+  目標 HTTP 面・aruaru.yaml スキーマ・フェーズ P0〜P6・付録 A/B)。
+- P1: `crates/aruaru-server/src/config/{mod,reconcile,watch}.rs` 新設。
+  `AruaruConfig` ロード + `${VAR}` 展開 + mtime ポーリング/SIGHUP ホット
+  リロード + 冪等 reconcile。`--config <path>` フラグ。`aruaru.example.yaml`。
+- P2: `query.parallel` 7→4 フィールド統一(`admin_shared::ParallelConfigState`、
+  reconcile 接続、GraphQL `parallelConfig` 実データ化、`setParallelConfig` 撤廃、
+  REST `GET/POST /admin/parallel` 削除)。`follower_read.target_lag_ms` を
+  `ClosedTimestampCoordinator`/`Tracker` の `Arc<AtomicU64>` 共有化で完全
+  ホットリロード。`wal`/`sharded_store` は静的扱い確定。
+- P3 一部: `/admin/parallel/explain`・`/admin/parallel/jobs` 撤廃 → GraphQL
+  `explainDistributed`(実ロジック移植・AdminQuery へ)・`parallelJobs`。
+  `/v1/keys/self-issue` 撤廃 → `selfIssueKey` mutation(認証ガード無し)。
+  `disaster_backup.email` config スキーマを 7 フィールドへ拡張(reconcile は
+  feature ゲート付きの別スライスで保留)。
+- 調査: WunderGraph Cosmo(router config / overview / Connect / Persisted
+  Operations / EDFS)、TiDB/TiKV+TiFlash(VLDB 2020)、K8s/GitOps
+  reconciliation、SPIFFE/SPIRE を英日・多言語で。→ §2 哲学、付録 A/B。
+
+**検証**: 各スライスで `cargo test -p aruaru-dist -p aruaru-graphql
+-p aruaru-server` 失敗0(config 7 + reconcile 3 + GraphQL 4 の新規テスト)。
+`cargo build -p aruaru-server` 既存2警告のみ。Tauri(`admin/src-tauri`、
+ワークスペース外)はソース編集のみ・この環境でビルド未検証。
+
+**次回の起点**: 本ファイル冒頭「🛑 復活用メッセージ」を読む。P3 本体は
+`closed-timestamp` の GraphQL 化から(`AdminCtx.closed_ts` 注入)。
+
+**README 整合**: `README.md`・`README-Japan.md`・`README-English.md` の冒頭
+更新ノート、`PORTING.md` §7 を本再設計に合わせて日英で更新済み(続き9)。
+
+## HANDOFF追記(2026-08-31続き10) 再設計 付録A を 2026 最新設計へ大幅拡充 + P3 本体(closed-timestamp / wal-service / sharded-store の GraphQL 化・REST 撤廃)
+
+**依頼(要求③の深掘り + P3 本体)**: 「CockroachDB × Snowflake ハイブリッド
+変種の技術を、TiDB だけに限らず**関連する全て**を世界中の言語で Google /
+GitHub 調査し、**実装方法(アーキテクチャ・データ構造・アルゴリズム)まで**
+調べ、`docs/CONTROL_PLANE_REDESIGN.md` を 2026 年最新設計として再設計。
+その後 P3 本体を実装」。
+
+### (1) 付録 A を全面再構成(コミット `6e5b3e0`、push 待ち)
+
+英・日・独で一次論文 / 公式 docs / GitHub を再調査。`docs/CONTROL_PLANE_
+REDESIGN.md` 付録 A を **59 行 → 約 400 行**へ:
+- **A.0** 「特殊な変種」を一文で定義 + 取り込む性質 13 項目の対応表(crate 明記)。
+- **A.1** 実装方法を 9 系統で詳述(出典 URL 併記):
+  TiDB/TiFlash(DeltaTree = B+木 × LSM、TiFlash proxy が FFI で apply 結果を
+  push、learner が行→列変換)、CockroachDB(Range / HLC / Pebble = RocksDB 系 /
+  closed ts / protected ts)、YugabyteDB(DocDB = カスタム RocksDB、IntentsDB に
+  provisional record)、Snowflake(不変マイクロパーティション 16MB / メタデータ
+  pruning / time travel はストレージ不変性の帰結)、Neon vs Aurora(Neon =
+  safekeeper Paxos quorum `flushLsn[n-quorum]` + pageserver materialize、
+  Aurora = モノリシック)、SingleStore(Universal Storage 5 機能 / 100 万行
+  segment / skiplist・hash index)、ClickHouse(MergeTree 不変 part + granule
+  8192 行スパース索引 + background merge、SharedMergeTree は Keeper が共有
+  メタデータの真実源で計算ステートレス)、Iceberg/Delta/Hudi 三種比較
+  (Iceberg = メタデータ木、Delta = 逐次 log + deletion vector、Hudi =
+  Merge-on-Read + record-level index)、Photon/DuckDB(FSST・ALP・型認識
+  軽量圧縮を analyze フェーズで選択)。
+- **A.2** 取り込み済みを crate 対応表で棚卸し(17 行)。
+- **A.3(A.6-x)** 未取込の取り込み判断:
+  - **取り込む**: HLC(`hlc.rs` 新設案)、**Raft-Learner 上の 行→列 非同期
+    変換レプリカ(本命、`ColumnarApplier` 案)**、Raft index + MVCC SI 検証、
+    DeltaTree / deletion vector / Merge-on-Read(段階的、deletion vector が最軽量)。
+  - **条件付き保留**: 型認識軽量圧縮(RLE/bitpack/FSST)——実データ規模が
+    ボトルネックになった時点。
+  - **取り込まない(理由明記)**: Aurora 型モノリシックストレージ(Neon 型分離の
+    方が follower read / ephemeral pod / 列レプリカと組み合わせやすい)。
+- **A.7** 本再設計への反映: `aruaru.yaml` に `htap:` セクション追加案
+  (`columnar_replicas` / `read_consistency` / `delta`)、execution-config で
+  クラスタ配布(TiDB PD / ClickHouse Keeper 相当)、`Query.htapReplicas` 新設案。
+
+### (2) P3 本体: closed-timestamp / wal-service / sharded-store を GraphQL 化 → REST 撤廃
+
+`object-table`(続き3)と同じ 5 手順(GraphQL query/mutation 新設 → `AdminCtx`
+へ `Arc` 注入 → `admin.rs` から REST ルート・ハンドラ・構造体削除 → `main.rs`
+配線 → test)を 3 群へ適用。**着手前に grep で Tauri/Android/web の該当 REST
+参照が皆無なことを確認済み**(`object-table`/`keys` と同じく安全に撤廃)。
+
+- **closed-timestamp**: `Query.closedTimestamp`(status、range ごとの closed_ts /
+  lowest_in_flight / target_lag)、`Query.planFollowerRead`(`table` 指定で
+  `select_follower_read` = `AS OF COMMIT` 経由の実データ読み出しまで)、
+  `Mutation.closedTsRegisterRange`、`Mutation.closedTsAdvance`。旧 REST
+  `GET /admin/closed-timestamp`・`/range`・`/advance`・`/plan` を削除。
+  `AdminCtx.closed_ts`(`closed_ts_coordinator()`)注入。**`/receive`・
+  `/publish` は B4** として残置(受信の実体は既に `binary_transport.rs` の
+  バイナリ経路、`/publish` は「いつ誰に配布するか」の人間向け制御トリガー、
+  P4 で再検討)。タイムスタンプ・LSN は u64 のため GraphQL では **String 表現**。
+- **wal-service**: `Query.walService`(status)、`Query.walPage`
+  (`get_page_at_lsn` = 読み取りなので Query。§4 表の B2 記載を §2.2 判断フローに
+  従い Query へ是正)、`Mutation.walAppend`、`Mutation.walCreateImageLayer`。
+  旧 REST 4 本を削除。`AdminCtx.wal_storage`(`wal_storage_handle()`)注入。
+  safekeeper 列挙を `0..n`→`1..=n` に是正(REST 版は先頭を取りこぼしていた)。
+- **sharded-store**: `Query.shardedStoreGet`、`Query.shardedStoreStats`、
+  `Mutation.shardedStorePut`。旧 REST 3 本を削除。`AdminState.sharded_store` を
+  `Arc` 化し `AdminCtx.sharded_store`(`sharded_store_handle()`)注入。
+  mpsc ブロッキング recv は `tokio::task::spawn_blocking` で退避(REST と同じ配慮、
+  `aruaru-graphql/Cargo.toml` に `tokio = { features = ["rt"] }` を通常依存追加)。
+- **ephemeral-query / multi-raft は次スライスへ(技術的理由を明記)**:
+  - `ephemeral-query`: `run_ephemeral_query` は `current_exe()` +
+    `tokio::process::Command` で自分自身を `--ephemeral-worker` 再起動する
+    `aruaru-server` バイナリ固有処理。`ephemeral_pod` は lib クレートに無く
+    `aruaru-graphql` から参照不能。`AdminCtx` へ `Arc<dyn EphemeralRunner>`
+    trait を注入し `aruaru-server` 側で実装する **trait 化リファクタが必要**。
+  - `multi-raft`: `MultiRaftCluster<crate::cluster::EngineApplier>` が
+    server-local ジェネリック。`split` は `applier: A` を要求し `AdminCtx` から
+    具体型を名指しできない。trait object 化 or `EngineApplier` のクレート移設が
+    必要。いずれも状態注入だけで済む上記 3 群とは規模が違うため分離
+    (「半端な足場を成果と呼ばない」原則、`docs/CONTROL_PLANE_REDESIGN.md`
+    §8 P3 に理由を明記)。
+
+**検証**: `cargo build -p aruaru-graphql -p aruaru-server`(debug)成功
+(既存 `build_cluster`/`propose_commit` の 2 警告のみ)。`cargo test -p
+aruaru-dist -p aruaru-graphql -p aruaru-server` **失敗 0**(aruaru-dist 72、
+aruaru-graphql 16〈新規 3: closed_timestamp / wal_service / sharded_store が
+GraphQL だけで完結〉、aruaru-server 13)。`cargo build --release` は実行中。
+**実プロセス HTTP での E2E(新 GraphQL クエリを実 `/graphql` へ叩く / 旧 REST
+パスが 404)はこのセッションでは未実施**——正直な未達事項(次スライス)。
+
+**次回の起点**: 本ファイル冒頭「🛑 復活用メッセージ」→ 次は
+`ephemeral-query` / `multi-raft` の trait 注入リファクタ、または A.6-2
+(Raft-Learner 行→列変換レプリカ)の着手。実プロセス HTTP E2E も残タスク。
+
+## HANDOFF追記(2026-08-31続き11) 実プロセス HTTP E2E(続き10の未達事項)を完了
+
+**経緯**: 別アカウント/別セッションから復帰。`git pull`(RUNO/open-english/
+aruaru-llm/aruaru-db 全て`Already up to date`——直前セッションが既に
+`250956d`までpush済みと確認)、`PORTING.md`のチェックポイント2節と
+CLAUDE.mdの2026-08-29 HANDOFFを読み、続き10が「正直な未達事項」として
+残していた「実プロセスHTTP E2E」から着手した(トラックA=open-english/
+aruaru-llm ASRとトラックB=aruaru-db REST撤廃のうち、直前の自分自身の
+作業文脈と連続性のあるBを選択)。
+
+**実施内容**: `cargo build --release -p aruaru-server`(36秒、キャッシュ
+済みのためP3本体コミット後初回にしては高速)成功。実際に`aruaru-server`を
+起動(`--data <一時dir> --pg-port 15532 --gql-port 15080 --raft-id 1`、
+`ARUARU_DB_ADMIN_TOKEN=e2etoken`)し、以下を全て実HTTPで確認:
+
+1. **旧REST撤廃の確認(誤検知を排除)**: `/admin/closed-timestamp`・
+   `/admin/wal-service`・`/admin/sharded-store`・`/admin/parallel`への
+   トークン無しリクエストは`401`だった——これは「まだ存在する」ことの
+   証明ではなく、`/admin/*`全体を包む認証ミドルウェアがルート未マッチの
+   404より先に認証チェックを行うために起きる見かけ上の結果だと気づき、
+   **正しいトークン付きで再検証**したところ全て`404`(真の削除)を確認。
+   一方`/admin/cluster`・`/admin/federation`・`/admin/backup`(削除対象
+   外)はトークン付きで`200`を確認——削除・残置の両方が意図通りである
+   ことを実証した。
+2. **新GraphQLフィールドの実データ動作確認**: `POST /graphql`へ実際に
+   `closedTimestamp`(query)→`closedTsRegisterRange`→`closedTsAdvance`
+   (mutation、`nowNanos: "10000000000"`→`closedTimestamp: "7000000000"`
+   が返る、target_lag=3秒の減算が正しく効いている)、`walService`
+   (query、`quorum: 2`・3台のsafekeeperの`flushLsn`、旧REST版が
+   取りこぼしていた1台目分も正しく`id: 1`から列挙されることを確認
+   ——続き10で修正した`0..n`→`1..=n`のoff-by-one是正の実証)、
+   `shardedStorePut`→`shardedStoreGet`(`key: "alpha"`→`shardId: 29`で
+   両呼び出しが一致、murmur3ルーティングの決定性を実証)を実行し、
+   いずれも期待通りの実データが返ることを確認。
+3. **`selfIssueKey`(P2続き8で撤廃した`POST /v1/keys/self-issue`の
+   GraphQL版)も無認証で実際にキーが発行される**ことを確認
+   (`adb_`プレフィックス付きキー、`role: "viewer"`、`expiresInHours: 24`)。
+4. サーバーログ(`tracing::json`)にエラー・パニックが一切無いことを
+   確認した上でプロセス終了・一時データディレクトリ削除。
+
+**正直な開示**: (a) これは単一プロセス・単一ノード構成での検証であり、
+複数ノードクラスタでの`closed-timestamp`のside transport(`/receive`・
+`/publish`、B4として意図的に残置されているREST)の実ネットワーク越し
+検証は今回のスコープ外。(b) `ephemeral-query`・`multi-raft`はまだREST
+のままのため、この2つのE2E確認は該当なし(次スライスで着手後に実施)。
+
+**次回の起点**: 「🛑 復活用メッセージ」の「次にやること」項目3
+(実プロセスHTTP E2E)を完了としてチェックを付ける。次は項目2
+(`ephemeral-query`/`multi-raft`のtrait注入リファクタ)または項目4
+(A.6-2 `ColumnarApplier`)に進むこと。
+
+## HANDOFF追記(2026-08-31続き12) `ephemeral-query`のtrait注入リファクタ完了(続き11の次項目2の前半)
+
+**課題(続き10が残した技術的理由)**: `run_ephemeral_query`は
+`current_exe()`+`tokio::process::Command`で自分自身を`--ephemeral-worker`
+再起動する`aruaru-server`バイナリ固有処理。`aruaru-graphql`は
+`aruaru-server`のmodを参照できない(循環依存)ため、GraphQL化には
+「型・trait定義を両者が依存できる`aruaru-dist`へ移設し、実装だけ
+`aruaru-server`に残す」という`admin_shared.rs`/`keyring.rs`と同じ
+リファクタが必要だった。
+
+**実装**:
+1. **`crates/aruaru-dist/src/ephemeral.rs`(新規)**: `EphemeralTable`/
+   `EphemeralRequest`/`EphemeralResponse`(元`aruaru-server::
+   ephemeral_pod`から移設)+`snapshot_for_tenant`(同)+新設
+   `#[async_trait] pub trait EphemeralRunner { async fn run(&self,
+   &EphemeralRequest) -> anyhow::Result<EphemeralResponse>; }`。
+   `aruaru-dist/Cargo.toml`に`aruaru-query`依存を追加(循環依存でない
+   ことを確認済み——`aruaru-query`/`aruaru-core`は`aruaru-dist`に
+   依存しない)。
+2. **`aruaru-server::ephemeral_pod`**: 型定義を`aruaru_dist::ephemeral`
+   からの再エクスポートに置き換え、`run_ephemeral_query`(実プロセス
+   起動、`aruaru-server`固有処理として残置)はそのまま。新設
+   `ProcessEphemeralRunner`(`current_exe()`を1回だけ解決して保持)が
+   `EphemeralRunner` traitを実装。
+3. **`aruaru-server::admin.rs`**: 旧REST `POST /admin/ephemeral-query`・
+   `EphemeralQueryRequest`・`ephemeral_query`ハンドラを削除(着手前に
+   `admin/`/`web/`双方でTauri/webクライアントの参照が皆無なことを
+   `grep`で確認済み)。
+4. **`aruaru-graphql`**: `AdminCtx.ephemeral: Option<Arc<dyn
+   aruaru_dist::ephemeral::EphemeralRunner>>`を追加、
+   `Mutation.ephemeralQuery(tenantId, tables: [String], sql: String) ->
+   EphemeralQueryResultGql`を新設(`snapshot_for_tenant`→
+   `runner.run()`→`response_to_gql`で結果変換、未注入時は
+   `message: "ephemeral runner is not configured"`で正直に失敗)。
+5. **`aruaru-server::main.rs`**: `ProcessEphemeralRunner::new()`を起動時
+   に1回構築し`Arc<dyn EphemeralRunner>`として`AdminCtx.ephemeral`へ
+   注入(`current_exe()`失敗時は`None`+`tracing::warn!`、既存の
+   `topology`等と同じフォールバック方針)。
+
+**検証(実測)**: `cargo build --workspace`成功(既存2警告のみ)。
+`cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+**失敗0**(aruaru-dist 73、aruaru-graphql **17**〈新規2: trait自体の
+object-safety検証+resolver経由でのSQL実行検証〉、aruaru-server 13)。
+`aruaru-backup`の`s3::tests::full_key_joins_prefix_and_key_with_
+exactly_one_slash`が`cargo test --workspace`(並列)で1件failedしたが
+`--test-threads=1`で37/37 green——既知のパターン(複数テストが
+プロセスグローバルなAWS環境変数を並行して読み書きするレース、
+このセッションで新規に発生させたものではない)。
+
+**実プロセスHTTP E2E(型チェック・単体テストのみで終わらせない)**:
+実`aruaru-server.exe`を起動し、(a) `POST /admin/ephemeral-query`が
+正しいトークン付きで実際に`404`(真の削除)、(b)
+`federatedQuery`で`items`テーブルを作成・1行挿入後、
+`ephemeralQuery(tenantId: "tenantA", tables: ["items"], sql: "SELECT *
+FROM items")`が**実際に子プロセスを起動し**、`{"columns":["id","qty"],
+"rows":[["1","42"]]}`という実データを返すことを確認(モックではない
+実プロセス間通信)。サーバーログにエラー・パニック無し。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目2の後半=`multi-raft`
+(`MultiRaftCluster<crate::cluster::EngineApplier>`のtrait object化 or
+`EngineApplier`のクレート移設)、または項目4(A.6-2 `ColumnarApplier`)。
+
+## HANDOFF追記(2026-08-31続き13) `multi-raft`のGraphQL化完了(続き12の
+次項目2の後半、P3本体の最終スライス)
+
+**課題(続き10/12が残した技術的理由)**: `MultiRaftCluster<crate::
+cluster::EngineApplier>`は`aruaru-server`側のジェネリック具体型であり、
+`aruaru-graphql`から参照できなかった。続き12が検討していた
+`Arc<dyn MultiRaftHandle>`trait object化と`EngineApplier`のクレート
+移設の2案のうち、**後者(クレート移設)を採用**した——`EngineApplier`
+(`Applier for EngineApplier`実装)は`aruaru_query::QueryEngine`にしか
+依存しておらず、続き12で`aruaru-dist`が`aruaru-query`への依存を
+既に獲得していたため、`aruaru_dist::engine_applier`へそのまま
+移設できると判明し、trait object化より単純だった。
+
+**実装**:
+1. **`crates/aruaru-dist/src/engine_applier.rs`(新規)**: `EngineApplier`
+   struct・`new()`・`impl Applier for EngineApplier`(`crate::raft::
+   {Applier, Command, CommandResponse}`使用)を`aruaru-server::cluster`
+   から移設。単体テスト1件(`exec_and_commit_apply_to_the_shared_
+   engine`)も移設。
+2. **`crates/aruaru-dist/src/lib.rs`**: `pub mod engine_applier;`+
+   `pub use engine_applier::EngineApplier;`を追加。
+3. **`crates/aruaru-server/src/cluster.rs`**: ローカル`EngineApplier`
+   定義を削除し`pub use aruaru_dist::EngineApplier;`へ置換(既存の
+   `crate::cluster::EngineApplier`という参照経路は変えず単純な
+   再エクスポート)。`build_cluster`/`build_cluster_with_learners`が
+   引き続き`aruaru_query::QueryEngine`/`aruaru_dist::Command`を直接
+   使うため、それぞれのuse文は維持。
+4. **`crates/aruaru-server/src/admin.rs`**: 旧REST
+   `POST /admin/multi-raft/{split,merge}`・
+   `GET /admin/multi-raft/scatter-query`の3ルート・3ハンドラ・
+   `MultiRaftSplitRequest`/`MultiRaftMergeRequest`構造体を削除
+   (着手前に`admin/src`・`web/src`双方でTauri/webクライアントの
+   参照が皆無なことを`grep`で確認済み)。呼び出し元が消えたため
+   `AdminState::multi_raft()`getterも削除(`attach_multi_raft`と
+   下位の`Mutex<Option<Arc<...>>>`フィールドは`main.rs`起動時の
+   注入で引き続き使用するため残置)。
+5. **`crates/aruaru-graphql`**: `AdminCtx.multi_raft: Option<Arc<
+   aruaru_dist::MultiRaftCluster<aruaru_dist::EngineApplier>>>`を
+   追加(具体型のまま共有、trait objectは不要だった)。
+   `Query.multiRaftScatterQuery`・`Mutation.multiRaftSplit`
+   (range_id, split_key)・`Mutation.multiRaftMerge`(range_a,
+   range_b)を新設、`MultiRaftSplitResultGql`/`MultiRaftMergeResultGql`/
+   `MultiRaftRangeReadingGql`を`admin_types.rs`へ追加。
+6. **`crates/aruaru-server/src/main.rs`**: `attach_multi_raft`が
+   `multi_raft_cluster`を消費する直前に`.clone()`して
+   `AdminCtx.multi_raft`へも配線(1つの`Arc`インスタンスをREST起動時
+   構築経路とGraphQL経路が共有)。
+
+**検証(実測、型チェック・単体テストのみで終わらせない方針の徹底)**:
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+  **失敗0**(aruaru-dist 74、aruaru-graphql **18**〈新規1:
+  `multi_raft_split_merge_and_scatter_query_operate_on_the_shared_
+  cluster`——split→scatter→merge→存在しないrange_idでの失敗ケース→
+  未設定時のケースまでの一連をカバー〉、aruaru-server 13)。
+- `cargo build --release -p aruaru-server`成功。実`aruaru-server.exe`
+  を起動(`--data <一時dir> --gql-port 15081 --raft-id 1`、
+  `ARUARU_DB_ADMIN_TOKEN`設定)し、`POST /graphql`へ実際に:
+  `multiRaftScatterQuery`(分割前、`rangeId:1`のみ)→
+  `multiRaftSplit(rangeId:1, splitKey:"m")`(`newRangeId:2,
+  rangeCount:2`)→`multiRaftScatterQuery`(分割後、`rangeId:1,2`の
+  2件)→`multiRaftMerge(rangeA:1, rangeB:2)`(`mergedRangeId:1,
+  rangeCount:1`)→`multiRaftScatterQuery`(併合後、`rangeId:1`のみ)の
+  一連を実行し、range数が1→2→1と正しく遷移することを確認。
+  旧REST`/admin/multi-raft/{split,merge,scatter-query}`はトークン付き
+  で全て`404`(真の削除)、残置`/admin/cluster`はトークン付きで`200`
+  (非破壊)を確認。サーバーログにエラー・パニック無し、プロセス終了・
+  一時データディレクトリ削除済み。
+
+**P3本体、これで完了**: `closed-timestamp`(続き10)・`wal-service`
+(続き10)・`sharded-store`(続き10)・`ephemeral-query`(続き12)・
+`multi-raft`(続き13、本エントリ)の5機能全てがGraphQL化+該当REST
+ルート撤廃+実プロセスHTTP E2Eまで完了した。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目4=要求③の実装トラック
+(付録A.6-2「Raft-Learner上の行→列非同期変換レプリカ
+(`ColumnarApplier`)」が本命、A.6-1 HLC・A.6-4 deletion vectorも。
+`aruaru.yaml: htap`セクション(§5・A.7)を先に足すこと)。
+
+## HANDOFF追記(2026-08-31続き14) 要求③実装トラック着手: A.6-1 HLC実装完了
+
+**位置づけ**: P3本体(続き13)完了を受け、次の優先項目である要求③
+(CockroachDB×Snowflakeハイブリッド変種の実装理論取り込み)の実装
+トラックへ着手。付録A.6-1〜A.6-4のうち、他の3項目(A.6-2
+`ColumnarApplier`・A.6-3 SI検証・A.6-4 deletion vector)の前提となる
+最小単位である**A.6-1 HLC(Hybrid Logical Clock)**から着手した
+(他項目は既存タイムスタンプ源の差し替えを伴うため、まずHLC自体を
+単体で正しく動く形にしてから配線するのが手戻りが少ないと判断)。
+
+**実装**: `crates/aruaru-dist/src/hlc.rs`(新規)。
+- `HlcTimestamp { pt: u64, l: u32 }`(物理成分+論理成分)。
+- `Hlc`本体は`AtomicU64`1個に`pt`(上位)・`l`(下位16bit)をパックして
+  保持し、`now()`/`update()`をCAS(compare-and-swap)ループで実装
+  ——`parking_lot::Mutex`を使わないロックフリー設計(複数スレッドから
+  同時に呼ばれても正しく単調増加することをテストで実証)。
+- `now(wall_now_nanos)`: 論文/CockroachDB `hlc.go`と同じアルゴリズム
+  (`pt' = max(pt, wall_now)`、`pt'==pt`なら`l++`、そうでなければ`l=0`)。
+  壁時計を引数として受け取る設計(`SystemTime::now()`を直接呼ばない)
+  にしたことで、決定的なテストが書けるようにした。
+- `update(remote, wall_now_nanos)`: リモートから受信したHLCと自クロック
+  を統合(`pt`はローカル・リモート・壁時計の最大値、`l`はどれが採用
+  されたかに応じて単調増加を保証)。
+- `as_nanos()`: 既存の`closed_ts`/`wal_service`/`multi_raft`が受け取る
+  「論理ナノ秒(u64)」形式へエンコードする変換メソッド——既存APIの
+  型シグネチャを変更せずに、HLCタイムスタンプをそのまま渡せるように
+  するための橋渡し(`pt`を16bit左シフトし`l`を下位へ詰める)。
+
+**正直な簡略化点(誇張しない)**:
+1. **クロックスキュー上限は未実装**——CockroachDBの`max_offset`
+   (許容できるノード間時計ズレの上限を超えたら操作を拒否する安全弁)
+   に相当する仕組みは無く、`update()`は常に受理する。
+2. **ネットワーク越しの実際のHLC伝播は本モジュール単体では提供しない**
+   ——「送信時に相乗り・受信時にupdate」という配線は、
+   `raft/transport.rs`等の呼び出し側が明示的に行う必要がある(今回は
+   未実施)。
+3. **`closed_ts`/`wal_service`/`multi_raft`への実配線は未実施**
+   ——これらは引き続き「呼び出し側が論理ナノ秒を渡す」既存の設計の
+   ままで、`Hlc::now().as_nanos()`をその呼び出し元に代入する変更は
+   次回以降(A.6-3のSI検証と合わせて設計するのが自然)。
+
+**検証(実測)**: `cargo test -p aruaru-dist hlc` → **9 passed / 0
+failed**(壁時計前進時の`pt`更新・論理カウンタのインクリメント・
+繰り返し呼び出しでの単調性・リモート優位/ローカル優位/壁時計優位の
+3パターン全ての`update()`結果・8スレッド×200回の並行呼び出しで
+重複タイムスタンプが1件も発生しないことを直接検証)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目4の続き=A.6-2
+`ColumnarApplier`(Raft-Learner上の行→列非同期変換レプリカ、本命)、
+または今回実装したHLCを`closed_ts`/`wal_service`/`multi_raft`の
+タイムスタンプ源へ実際に配線する作業。`aruaru.yaml: htap`セクション
+(§5・A.7)の実装も未着手のまま。
+
+## HANDOFF追記(2026-08-31続き15) A.6-2 `ColumnarApplier`(本命)実装完了
+
+**位置づけ**: 続き14(HLC)に続き、要求③実装トラックの本命である
+A.6-2「Raft-Learner上の行→列非同期変換レプリカ」を実装した。
+`docs/CONTROL_PLANE_REDESIGN.md`付録A.6-2が明記していた設計方針
+(「learnerノードに`ColumnarApplier`(`Applier` trait実装)を注入し、
+Raft commitごとに行→列変換して`table_format`のblockへ追記」)に沿って
+実装。
+
+**実装**: `crates/aruaru-dist/src/columnar_applier.rs`(新規)。
+- `ColumnarApplier`が`Applier` traitを実装。内部に行ストアのローカル
+  ミラー(`Arc<QueryEngine>`、`EngineApplier`と同じ意味論でSQLを適用)
+  を持ち、`apply()`で(1)行ストア側への適用、(2)成功時のみ
+  `parser::parse`で触れたテーブル名を特定し、そのテーブル全体を
+  `aruaru-backup::table_format`(Databend方式のsnapshot→segment→block、
+  2026-08-22実装済みのものをそのまま再利用)の1 blockへ列変換して
+  commit、の2段階を行う。
+- 列変換の中身: 数値列(Int/BigInt/Float)ごとのmin/max統計
+  (`BlockMeta::with_stats`)+ 主キー列のbloom filter
+  (`BlockMeta::with_bloom`、等値枝刈り用)。テーブル名→`table_id`は
+  `SHA-256(table_name)`の先頭8バイトから決定的に導出(Databendの
+  `(db_id, table_id)`キー空間をそのまま流用するため)。
+- `crates/aruaru-dist/Cargo.toml`に`aruaru-backup`依存を追加
+  (循環依存にならないことを確認済み——`aruaru-backup`は`aruaru-core`/
+  `aruaru-query`にのみ依存し`aruaru-dist`には依存しない)。
+
+**実装中に見つけた自分のミスと修正**: `Cargo.toml`への依存追加編集で
+誤って既存の`aruaru-query`依存行そのものを消してしまい、
+`aruaru_query`が全クレートで解決不能になるビルドエラーを引き起こした
+(`engine_applier.rs`/`ephemeral.rs`等、無関係な既存ファイルまで
+エラーになったため気づいた)。`aruaru-query`依存行を復元して解消。
+
+**正直な簡略化点(誇張しない、コード冒頭コメントにも明記)**:
+1. **「本物の行→列delta蓄積」ではなく「テーブル全体の都度再構築」**
+   ——TiFlashのDeltaTree(小さなdeltaを蓄積し閾値でcompaction)とは
+   異なる。`aruaru-query::olap::OlapCache`が既に明記している簡略化と
+   同じ判断(まず正しさを実証、delta蓄積はA.6-4で段階的に)。
+2. **block実体(Parquet相当)は書かない**——`table_format::BlockMeta`
+   自体が元々「メタデータ+枝刈り・コミットの正しさ」担当という設計
+   (2026-08-22実装時からの制約)をそのまま引き継ぐ。
+3. **同一プロセス内の`Applier`注入で検証**——ネットワーク越しの別
+   プロセスlearnerへの実配線(`binary_transport.rs`経由の複製自体は
+   既存、2026-08-21実装済み)と組み合わせる作業は次段階。
+4. **A.6-3(Raft index + MVCCによるSI検証)とは未接続**。
+
+**検証(実測)**: `cargo test -p aruaru-dist columnar_applier` →
+**5 passed / 0 failed**(CREATE TABLE直後から空スナップショットが
+存在すること、書き込みのたびに新しいスナップショットIDへ連鎖する
+こと〈時間旅行の基礎〉、UPDATE/DELETE後も行ストアと列レプリカの
+最終状態が一致すること、行ストア側で失敗したSQLは列レプリカを
+一切変更しないこと、SELECT/BEGIN/COMMIT等の読み取り・トランザクション
+制御文はレプリケーションを起動しないこと、`aruaru_commit`〈Git-on-SQL
+マーカー〉自体は列レプリカを再構築しないこと、を直接検証)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test -p aruaru-dist
+-p aruaru-backup` → aruaru-dist **88 passed**・aruaru-backup
+**37 passed**、失敗0(既存テストへのリグレッション無し)。
+
+**次回の起点**: (1) `ColumnarApplier`を実際に`--raft-role learner`の
+ノードへ`Applier`として注入し、実プロセス間(2026-08-21確立済みの
+2プロセス構成)でRaft commitが列レプリカへ反映されることを実HTTP/
+実プロセスで検証、(2) A.6-4 deletion vector(delta蓄積の第一歩、
+`table_format::BlockMeta`への拡張)、(3) HLCを`closed_ts`等へ配線、
+(4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き16) A.6-2の「残課題」= 実learnerプロセスへの実配線・実HTTP検証を完了
+
+**位置づけ**: 続き15が「正直な残課題」として明記していた「実learner
+プロセスへの実配線・実HTTP検証は未実施」を今回のパスで解消した。
+
+**実装**:
+1. **`crates/aruaru-dist/src/raft/node.rs`**: `Applier` traitに
+   `impl<A: Applier + ?Sized> Applier for Arc<A>`のblanket implを追加。
+   `RaftNode<A>`は`applier: A`を値として保持するため、`RaftNode<Arc<
+   ColumnarApplier>>`として構築すれば、呼び出し元(HTTP観測エンドポイント)
+   が同じ`ColumnarApplier`インスタンスをRaftNodeへ渡した後も共有して
+   読み続けられる。
+2. **`crates/aruaru-server/src/cluster.rs`**: `ColumnarClusterNode`
+   (`RaftNode<Arc<ColumnarApplier>>`)・`ColumnarClusterDriver`型エイリアス
+   と`build_columnar_learner_cluster()`を新設(`self_is_learner=true`
+   固定、voter/leaderとしては使わない専用コンストラクタ)。
+3. **`crates/aruaru-server/src/columnar_pod.rs`(新規)**: `--columnar-
+   learner`起動フロー専用の最小限HTTPサーバー。`GET /healthz`・
+   `GET /columnar/:table`(`latest_snapshot_id`/`replication_count`/
+   行数を返す)。**正直な開示**: 本番`admin.rs`の`KeyGuardian`認証とは
+   独立した簡易実装(`ARUARU_DB_ADMIN_TOKEN`の定数時間比較のみ)——
+   この検証用途に限定。
+4. **`crates/aruaru-server/src/main.rs`**: `--columnar-learner`CLIフラグ
+   新設。有効時は`ephemeral_worker`と同じ「早期分岐で通常のサーバー
+   起動フローを一切経由しない」パターンを踏襲——`ColumnarApplier`を
+   注入した`RaftNode`+`RaftDriver`を構築し、`serve_binary_raft`
+   (既存のバイナリRaft/WALリスナー、`--gql-port + BINARY_RAFT_PORT_
+   OFFSET`)とHTTP観測面(`columnar_pod::serve`、`--gql-port`)の両方を
+   起動して待ち受け続ける。leader側の`--learner-peers`にこの
+   columnar learnerのアドレスを含めれば、既存の学習済み仕組み
+   (2026-08-21確立、`to_binary_peer_addr`によるポートオフセット計算)が
+   そのまま使える(新しい複製プロトコルは作っていない)。
+
+**実プロセスHTTP E2E(型チェック・単体テストのみで終わらせない)**:
+実際に2プロセス起動——leader(`--raft-id 1 --learner-peers
+"2@127.0.0.1:15181"`、通常の`EngineApplier`)、columnar learner
+(`--raft-id 2 --raft-role learner --peers "1@127.0.0.1:15180"
+--columnar-learner --gql-port 15181`)。leaderへ`POST /admin/cluster/
+propose`で`CREATE TABLE items`→`INSERT (qty=42)`→`UPDATE (qty=99)`を
+実行し、その都度**別プロセスのcolumnar learnerへ`GET /columnar/items`
+を実HTTPで叩いて確認**:
+- `CREATE TABLE`+`INSERT`後: `{"replicationCount":2,"rowCount":1}`
+  (実際に挿入した行がRaft経由で列レプリカ側にも反映)。
+- `UPDATE`後: `{"replicationCount":3,"rowCount":1}`、スナップショットID
+  が前回と異なる値へ変化(時間旅行の連鎖が実際に機能)。
+- 誤ったトークンでの`GET /columnar/items`は`401`。
+- 両プロセスの標準エラーログにエラー・パニック無し。
+
+これにより「TiFlash型HTAPの核心(Raft learnerが受け取ったcommitを
+独立の列指向ストアへ変換する)」が、単体テストだけでなく**実際に
+別プロセス・実TCP経由で機能する**ことを実証した。
+
+**検証(実測)**: `cargo build --workspace` → 成功(既存の
+`build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+
+**なお残る簡略化点(誇張しない)**: (1) `--columnar-learner`は検証専用の
+独立起動フローであり、本番の`admin.rs`/GraphQL(`AdminCtx`)へは未統合
+——`Query.htapReplicas`(§5・A.7で構想済み)のような正規の観測APIとして
+公開する作業は次段階。(2) 依然としてテーブル全体再構築方式(A.6-4の
+delta蓄積が真の解決)。(3) `--columnar-learner`のHTTP認証は簡易実装
+(上記3参照)。
+
+**次回の起点**: (1) A.6-4 deletion vector、(2) HLCを`closed_ts`等へ
+配線、(3) `aruaru.yaml: htap`セクション(§5・A.7)の実装(この際に
+`--columnar-learner`を正規の宣言的設定〈`columnar_replicas`〉経由の
+起動へ統合することも検討)、(4) `--columnar-learner`をGraphQL
+`Query.htapReplicas`として正式公開。
+
+## HANDOFF追記(2026-08-31続き17) A.6-4 段階1「deletion vector」実装完了
+
+**位置づけ**: 続き16の「次回の起点」筆頭であったA.6-4に着手。付録
+A.6-4が優先度順に挙げる2段階(1. deletion vector、2. base+deltaの
+Merge-on-Read)のうち、実装が最も軽く効果が大きいとされる**段階1
+deletion vector**を実装した。
+
+**実装**: `crates/aruaru-backup/src/table_format.rs`。
+- `BlockMeta`に`deletion_vector: BTreeSet<u64>`フィールドを追加
+  (`#[serde(default)]`で既存の永続化済みJSON〈A.6-4導入前のblock〉との
+  後方互換を保証)。
+- `with_deleted(row_position)`(ビルダー、複数回呼べる)・
+  `is_deleted(row_position) -> bool`・`live_row_count() -> u64`
+  (`row_count`から論理削除された行数を`saturating_sub`で安全に除いた
+  実効行数)を追加。
+- `SegmentMeta::live_row_count()`で複数blockにまたがる実効行数を集約。
+
+**正直な簡略化点(誇張しない、コード冒頭コメントにも明記)**:
+1. Delta Lakeの実プロトコルは32bit RoaringBitmap(圧縮ビットマップ、
+   64bit位置を上位32bit=key/下位32bitへ分割)を使うが、本実装は
+   `BTreeSet<u64>`(非圧縮の順序集合)——**意味論は同一**だが大量削除時の
+   メモリ効率はRoaringBitmapに劣る。行数がボトルネックになった時点で
+   置き換えを検討する。
+2. **`ColumnarApplier`(A.6-2)への配線はまだ無い**——A.6-2は依然として
+   テーブル全体を都度再構築する設計であり、deletion vector自体を
+   実際の書き込みパスから呼ぶ変更はしていない。今回は「単体で正しく
+   動くdeletion vector」を先に用意した段階(TiFlash DeltaTreeの
+   delta+base方式〈段階2 MoR〉へA.6-2を格上げする際の基盤)。
+3. `prune_range`/`prune_equality`(既存の枝刈りAPI)も`live_row_count`を
+   考慮するようには未接続——枝刈り結果に論理削除行が含まれたままになる
+   (次段階)。
+
+**検証(実測)**: `cargo test -p aruaru-backup table_format` →
+**15 passed / 0 failed**(新規5件: 削除マークと`is_deleted`/
+`live_row_count`の直接検証、範囲外位置での`saturating_sub`保護、
+複数blockにまたがるsegment単位の集約、JSON往復でのシリアライズ
+保持、**A.6-4導入前の`deletion_vector`フィールド無しJSONが後方互換
+でデシリアライズできること**〈`#[serde(default)]`の実証〉)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test -p
+aruaru-backup -p aruaru-dist` → aruaru-backup **42 passed**・
+aruaru-dist **88 passed**、失敗0(既存テストへのリグレッション無し)。
+
+**次回の起点**: (1) A.6-4段階2(base+deltaのMerge-on-Read、
+`ColumnarApplier`をdelta蓄積方式へ格上げ)、(2) `prune_range`/
+`prune_equality`が`live_row_count`/`is_deleted`を考慮するようにする
+配線、(3) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
+(4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き18) 続き17が残した「未配線」を即座に解消: prune_range/prune_equalityがdeletion vectorを尊重
+
+**位置づけ**: 続き17完了直後、ユーザーから「投げやり・その場しのぎ
+禁止」の原則(半分繋がった足場を成果と呼ばない)に沿って、着手した
+スライスは難所も含めて最後まで通すよう指示。deletion vectorを実装
+しただけで枝刈りAPIから使われないままでは「宣言しただけの機能」に
+なるため、即座に配線した。
+
+**実装**: `crates/aruaru-backup/src/table_format.rs`。
+- `prune_range`: 各blockのループで、`row_count > 0 &&
+  live_row_count() == 0`(全行が論理削除済み)なら、min/max統計の
+  判定を待たず即座に`skipped_blocks`へカウントして読み飛ばす
+  ——統計が古い値のままでも「実際に返す行が0件」は確定しているため
+  安全。
+- `prune_equality`: 同様に、bloom filterの判定より先に全行削除済み
+  blockを除外する。
+
+**検証(実測)**: `cargo test -p aruaru-backup table_format` →
+**18 passed / 0 failed**(続き17の15件+新規3件:
+`prune_range_skips_blocks_whose_every_row_is_logically_deleted`
+〈統計上マッチする範囲でも全行削除済みblockは返らない〉、
+`prune_equality_skips_blocks_whose_every_row_is_logically_deleted`
+〈bloom filterがマッチしても全行削除済みblockは返らない〉、
+`prune_range_still_returns_partially_deleted_blocks`〈一部だけ削除
+されたblockは引き続き通常どおり統計判定の対象になる、over-pruning
+していないことの確認〉)。`cargo build --workspace` → 成功(既存の
+`build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+
+**まだ残る配線(誇張しない)**: `ColumnarApplier`(A.6-2)が実際の
+DELETE/UPDATE発生時に`with_deleted`を呼ぶ**書き込み側**の経路は
+まだ無い——今回完成したのは読み取り側(枝刈りが`deletion_vector`を
+正しく尊重すること)のみ。`ColumnarApplier`をテーブル全体再構築方式
+からdelta+base方式へ格上げする際に、この書き込み側を接続する。
+
+**次回の起点**: (1) A.6-4段階2(base+deltaのMerge-on-Read、
+`ColumnarApplier`の書き込み側からdeletion vectorを実際に呼ぶ配線を
+含む)、(2) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
+(3) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き19) 本日の全実装(続き13〜18)をVPSへ反映+実バグ1件発見・修正
+
+**位置づけ**: 続き13(multi-raft REST撤廃)〜続き18(prune配線)の全実装を
+VPS(`ssh conoha`、`/root/aruaru-db`)へ反映し、実サービスで動作確認した。
+
+**実施内容**:
+1. VPS上の`/root/aruaru-db`(`git status`でCargo.lock系の自動生成差分
+   のみ、実質クリーンを確認)で`git pull origin main`(`250956d`→
+   `c0d3ce9`、23ファイル・2179行超の差分を反映)。
+2. **実バグ発見・修正**: `cargo build --release -p aruaru-server`が
+   `failed to read '/root/repository/open-raid-z/.../Cargo.toml':
+   No such file or directory`で失敗。原因調査の結果、`/root/aruaru-db`
+   は`/root/repository/aruaru-db`へのシンボリックリンクだが、
+   `aruaru-dist`の`Cargo.toml`が`open_raid_z_core`をpath依存
+   (`../../../open-raid-z/...`)として参照しており、この相対パスは
+   `/root/repository/open-raid-z/...`に解決される——しかし実際の
+   `open-raid-z`リポジトリは`/root/open-raid-z`に存在し
+   `/root/repository/open-raid-z`は存在しなかった(ローカル開発環境
+   〈`F:\runo\repository\aruaru-db`と`F:\runo\repository\open-raid-z`
+   が兄弟ディレクトリ〉とVPSのディレクトリ構成が食い違っていた、
+   本セッションの変更が原因ではない既存の構成不整合)。
+   `ln -sf /root/open-raid-z /root/repository/open-raid-z`で解消
+   (Cargoのoptional path依存は、featureが無効でもマニフェスト自体は
+   解決できる必要があるため、この不整合はfeature無効ビルドでも
+   顕在化する)。
+3. `cargo build --release -p aruaru-server`成功(7分52秒、既存の
+   `build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+4. `systemctl restart aruaru-server`→`systemctl is-active`で`active`、
+   `curl http://127.0.0.1:4001/healthz`で`ok`、実際に
+   `POST /graphql`で`clusterStatus`クエリを実行し
+   `{"totalNodes":1,"healthyNodes":1}`が返ることを確認。起動ログに
+   エラー・パニック無し(DB-Engines巡回失敗の警告のみ、既知の
+   ネットワーク到達性起因で無関係)。
+5. `aruaru-db-web`(Web管理UI、リバースプロキシ)は今回の変更が
+   `web/`クレートへ影響しないため未再ビルド——`https://easy-web.tokyo/
+   aruaru-db/`が引き続き`200`を返すことのみ確認(非破壊であることの
+   確認)。
+6. 一時ビルドログ(`/root/aruaru_build.log`/`aruaru_build2.log`)を
+   削除、VPS上の状態をクリーンに保った。
+
+**正直な開示**: 今回反映した新機能(`--columnar-learner`起動フラグ、
+HLC、deletion vector)自体はVPS上の単一ノード常駐運用では現状呼ばれて
+いない(既存の`aruaru-server.service`は`--raft-id 1`のみ、複数プロセス
+構成やcolumnar learnerの実運用配備はしていない)——今回のVPS反映は
+「最新コードが実運用サービスとして正しくビルド・起動・応答すること」の
+確認であり、新機能自体の本番運用投入はまだ次段階。
+
+**次回の起点**: 続き18と同じ(A.6-4段階2、HLC配線、`aruaru.yaml: htap`)。
+加えて、VPS/ローカルのディレクトリ構成不整合(`open-raid-z`のパス)が
+今後同種のビルド失敗を再発させ得るため、次回VPSでこの種のエラーに
+遭遇したら本エントリの`ln -sf`対応を参照すること。
+
+## HANDOFF追記(2026-09-02続き20) A.6-4 段階2「base+delta の Merge-on-Read」実装完了 — deletion vector の書き込み側配線(続き18 の残課題)を解消
+
+**位置づけ**: 「🛑 復活用メッセージ」項目4=要求③実装トラックの本命
+(A.6-2 `ColumnarApplier`)を、続き18 が「まだ残る配線(誇張しない)」と
+明記していた**書き込み側**(実際の DELETE/UPDATE 発生時に deletion
+vector を立てる経路)まで通した。
+
+**実装**(`crates/aruaru-dist/src/columnar_applier.rs`、`ColumnarApplier`
+を都度フル再構築方式から base+delta 方式へ格上げ):
+- `TableReplicaState`(プロセスメモリ上、これが MoR の権威ある表現)に
+  `blocks: Vec<BlockMeta>`(`[0]`=base、`[1..]`=delta)、
+  `locations: HashMap<pk, RowLoc{block_idx,row_pos,row_hash}>`
+  (生きている行の位置)、`deltas_since_base`、`base_generation` を保持。
+- `replicate_table` を差分反映へ:
+  1. **DELETE / 主キーを変える UPDATE**: 以前は生きていたが今は行ストアに
+     無い主キー → その行がいる block の `deletion_vector` へ位置を
+     `insert`(block 実体は書き直さない = 即時 rewrite 無しの MoR)。
+  2. **INSERT / 行内容が変わった UPDATE**: 行内容ハッシュで検出し、
+     新規行だけの小さな **delta block** を1つ足す。in-place UPDATE は
+     旧位置を deletion vector へ退避してから delta へ再登録。
+  3. **compaction**: delta が `COMPACTION_THRESHOLD`(8)たまったら
+     テーブル全体から base を作り直して畳み込む(TiFlash DeltaTree の
+     閾値 compaction 相当)。
+- **`ObjectTable` は append-only の segment ログ**(`commit_blocks` が
+  親の segment 一覧を引き継いで追記する既存設計)なので、その commit で
+  **新しく書いた block だけ**(delta、または compaction 時の fresh base)を
+  `object_table.commit_blocks()` へ渡して時間旅行のスナップショット連鎖を
+  進める。「マージ済みの現在の姿」は `replica_state` が保持する
+  (`latest_blocks`/`latest_live_row_count` はここを読む)。
+- `crates/aruaru-server/src/columnar_pod.rs` の `GET /columnar/:table` に
+  `columnarBlockCount` / `columnarLiveRowCount` / `columnarDeletionVector
+  Positions` を追加(別プロセスから MoR・deletion vector 書き込みを観測)。
+
+**正直な簡略化点(誇張しない)**: (1) 差分検出は「主キー + 行内容の
+ハッシュ」粒度(列単位の部分更新追跡はしない)。(2) block 実体
+(Parquet 相当)は書かない(`table_format` の既存制約を踏襲)。
+(3) deletion vector は `BTreeSet<u64>`(非圧縮、`table_format` 側の
+既知課題)。(4) A.6-3(Raft index + MVCC SI 検証)とは未接続。
+(5) `prune_range`/`prune_equality` は続き18 で deletion vector を尊重済み
+だが、`ColumnarApplier` の block を実際に prune へ流し込む配線(観測 API
+経由の枝刈り込み読み取り)は未実施。
+
+**検証(実測)**:
+- `cargo test -p aruaru-dist columnar_applier` → **8 passed / 0 failed**
+  (新規5: 2回目 INSERT が delta を足す〈フル再構築でない〉/ DELETE が
+  block を書き直さず deletion vector を立てる / in-place UPDATE が旧位置を
+  退避し二重計上しない / 閾値で base へ compaction / compaction 後も
+  delta を足せる)。
+- `cargo test -p aruaru-dist -p aruaru-backup` → aruaru-dist **91 passed**・
+  aruaru-backup **45 passed**、失敗0(リグレッション無し)。
+- `cargo build --workspace` → 成功(既存の `build_cluster`/`propose_commit`
+  未使用警告2件のみ、無関係)。
+- **実プロセス 2 プロセス E2E**(型チェック・単体テストだけで終わらせない):
+  leader(`--raft-id 1 --gql-port 15180 --learner-peers "2@127.0.0.1:15181"`)
+  + columnar learner(`--raft-id 2 --raft-role learner --peers
+  "1@127.0.0.1:15180" --columnar-learner --gql-port 15181`)を実起動。
+  leader へ `POST /admin/cluster/propose` で CREATE→INSERT×3→
+  `UPDATE ... WHERE id='2'`→`DELETE ... WHERE id='1'` を流し、別プロセスの
+  learner へ `GET /columnar/items` を実 HTTP:
+  - 3 INSERT 後: `columnarBlockCount:4`(空 base + 3 delta)、
+    `columnarLiveRowCount:3`、`columnarDeletionVectorPositions:0`。
+  - in-place UPDATE 後: `blockCount:5`(delta 追加)、`liveRowCount:3`
+    (二重計上なし)、**`deletionVectorPositions:1`**(旧行位置をマーク)。
+  - DELETE 後: `blockCount:5`(**書き直しなし**)、`liveRowCount:2`、
+    **`deletionVectorPositions:2`**。
+  → バイナリ Raft 経由で learner へ複製された commit が、実際に
+  deletion vector を立てて MoR を維持していることを別プロセス実 HTTP で
+  実証した。
+
+**次にやること(要求③実装トラックの残り)**: (1) HLC(続き14 で
+`hlc.rs` 実装済み・未配線)を `closed_ts`/`wal_service`/`multi_raft` の
+タイムスタンプ源へ実配線(A.6-3 の SI 検証と合わせて設計するのが自然)、
+(2) `aruaru.yaml: htap` セクション(§5・A.7、`columnar_replicas`/
+`read_consistency`/`delta`)を実装し、`--columnar-learner` を宣言的設定
+経由の起動へ統合、(3) `ColumnarApplier` の block を `prune_range`/
+`prune_equality` へ流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
+(4) A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
+
+## HANDOFF追記(2026-09-02続き21) HLC タイムスタンプ・エンコーディングの設計ミス(u64オーバーフロー)を再設計・修正・配線
+
+**位置づけ**: ユーザー指摘「`hlc.rs` の `as_nanos()` が Unix ナノ秒 `pt` を
+`<<16` すると u64 オーバーフローする。**一から設計し直して新規設計書を
+まず完成させて**」への対応。
+
+### (1) 新規設計書(正本): `docs/HLC_TIMESTAMP_REDESIGN.md`
+
+一次資料調査(CockroachDB `timestamp.go` は物理=ナノ秒・論理を**別
+フィールド**でパックしない/ compact な 1 整数版は物理を ms・µs 粒度へ
+落として下位ビットを空ける)を踏まえ、案A(パックをやめ 2 フィールドで
+運ぶ=P3 で GraphQL 化したばかりの API を再全面変更、過大)ではなく
+**案B**を採用:
+
+- `Hlc` の内部 `pt` を**常に `wall & !0xFFFF`**(下位 16bit ゼロの
+  Unix ナノ秒、分解能 ≒ 65.536µs)として保持。論理カウンタ `l` は
+  その空いた 16bit にちょうど収まる。
+- `as_ordinal()`(旧 `as_nanos()`)= `(pt & PHYSICAL_MASK) | (l & 0xFFFF)`。
+  **左シフトしないためオーバーフローしない**。同一 65µs バケット内は
+  `l` で順序、バケットが進めば `pt` が 65536 以上ジャンプするため
+  `l`(< 65536)がどれだけ大きくても逆転不能(厳密単調)。
+- 論理枯渇時(65µs に 65536 回超のイベント、現実にはほぼ不可能)は
+  `pt` を次バケットへ先食いして `l=0`(単調性を絶対に壊さない)。
+- 正直な代償: 物理分解能 65.536µs(旧コメントが暗に主張していた
+  ナノ秒精度は失われる)。`closed_ts` の `target_lag` は秒単位のため
+  実用影響なし。`max_offset` 相当のスキュー上限は引き続き未実装。
+
+### (2) 実装(P-HLC-1): `crates/aruaru-dist/src/hlc.rs` 全面書き換え
+
+`as_nanos()` → `as_ordinal()` へ改名(`#[deprecated]` エイリアスは
+残す、外部呼び出し元ゼロを grep 確認済み)。`from_ordinal`・
+`now_ordinal`(`SystemTime` 内蔵の実運用向け)・`observe_ordinal`
+(side transport の u64 を復号して `update`)を新設。
+`cargo test -p aruaru-dist hlc::` **13 passed**(新規回帰:
+実 Unix ナノ秒での非オーバーフロー、バケット境界跨ぎの単調性、
+論理枯渇時の桁上げ、`observe_ordinal` の前進、並行 500×8 で
+ordinal 重複ゼロ)。
+
+### (3) 配線(P-HLC-2): `closed_ts` 系の「now 既定値」を HLC 由来へ
+
+- `AdminState`(aruaru-server)+ `AdminCtx`(aruaru-graphql)へ
+  `Arc<aruaru_dist::Hlc>` を追加、`main.rs` で同一インスタンス共有
+  (`hlc_handle()`、`topology`/`closed_ts`/`keyring` と同じパターン)。
+- `admin_resolvers.rs`: `now_unix_nanos()`(生 `SystemTime`)を
+  `now_default_nanos(ctx)`(HLC があれば `now_ordinal()`、無ければ
+  従来フォールバック)へ差し替え。`closedTsAdvance` /
+  `planFollowerRead` の `nowNanos` 省略時に効く(明示指定時は尊重、
+  既存挙動維持)。
+- `admin.rs::closed_ts_receive`(side transport 受信): 取り込んだ
+  更新の最大 closed-ts で `state.hlc.observe_ordinal(max, wall)`
+  ——「送信時に相乗り・受信時に update」という HLC の因果伝播。
+- `wal_service`(`commitLSN` は LSN であって時刻ではない)・
+  `multi_raft`(タイムスタンプを取らない)は HLC 対象外——付録 A.6-1
+  の記述をこの点で precise 化した。
+
+### 検証(実測)
+
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server` →
+  aruaru-dist **95 passed / 1 ignored**、aruaru-graphql **19 passed**
+  (新規 `closed_ts_advance_without_now_uses_monotonic_hlc_ordinal`)、
+  aruaru-server **13 passed / 1 ignored**、失敗0。
+- `cargo build --workspace` 成功(既存の `build_cluster`/
+  `propose_commit` 未使用警告2件のみ、無関係)。
+- **実プロセス HTTP E2E**: 実 `aruaru-server` を起動し、
+  `closedTsAdvance`(`nowNanos` 省略)→ HLC ordinal
+  `1788327316574937600`(≈ 1.788×10¹⁸、実 Unix ナノ秒スケール——
+  旧 `pt<<16` なら u64 ラップして桁が壊れていた値)、2 連続呼び出しで
+  厳密増加、`planFollowerRead`(now 省略)→ `plan=follower_read`、
+  旧 REST `/admin/closed-timestamp/advance` はトークン付きで `404`
+  (P3 撤廃は維持)を確認。
+
+### 次にやること(要求③実装トラックの残り)
+
+`aruaru.yaml: htap` セクション(§5・A.7、`columnar_replicas`/
+`read_consistency`/`delta.compaction_threshold`)+ `--columnar-learner` の
+宣言的設定経由起動への統合、`Query.htapReplicas` 相当の枝刈り込み
+観測 API、A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
+HLC の案A 全面移行・`max_offset` スキュー上限は
+`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来検討。
+
+## HANDOFF追記(2026-09-02続き22) 次フェーズ一括: htap 宣言的設定・
+枝刈り込み観測 API・A.6-3 SI 検証・HLC max_offset(ビルドまで)
+
+**位置づけ**: 「🛑 復活用メッセージ」項目4 の残り (a)〜(d) を一括で実装。
+ユーザー指示「ビルドまでで記録」に従い、`cargo test` / `cargo build
+--workspace` の成功までを検証範囲とし、実プロセス HTTP E2E は未実施。
+
+### (a) `aruaru.yaml: htap` セクション
+- `crates/aruaru-server/src/config/mod.rs`: `AruaruConfig` に
+  `pub htap: HtapConfig`。`HtapConfig`(`columnar_replicas: bool` /
+  `read_consistency: String` / `delta: HtapDeltaConfig`)・
+  `HtapDeltaConfig`(`compaction_threshold: usize`、既定 8)。いずれも
+  `#[serde(default, deny_unknown_fields)]` + `Default` impl。
+- `crates/aruaru-server/src/config/reconcile.rs`: 静的セクション差分検知
+  配列に `("htap", prev.htap != new.htap)` を追加(構築時固定 =
+  restart_required 扱い)。
+- `crates/aruaru-dist/src/columnar_applier.rs`:
+  `const COMPACTION_THRESHOLD` → `pub const DEFAULT_COMPACTION_THRESHOLD`、
+  `compaction_threshold: usize` フィールド + `pub fn
+  with_compaction_threshold(n)`(`0` は既定へフォールバック)。
+- `crates/aruaru-server/src/main.rs`: `--columnar-learner` 起動フローで
+  `--config` があれば `AruaruConfig::load` して
+  `htap.delta.compaction_threshold` を `with_compaction_threshold` へ渡す。
+- `aruaru.example.yaml` に `htap:` ブロックを追記。
+- テスト: `with_compaction_threshold_overrides_the_default`。
+
+### (b) `Query.htapReplicas` 相当の枝刈り込み観測 API
+- `ColumnarApplier::prune_range_preview(table, column, RangeOp, value)` /
+  `prune_equality_preview(table, column, key)` を新設。`replica_state` の
+  MoR ビュー(base+delta、deletion vector 込み)の block を、
+  `table_format` の `prune_range`/`prune_equality` と同じ
+  `ColumnStats::disproves` / `BloomFilter::may_contain` ロジックへ流し、
+  `HtapPrunePreview { total_blocks, kept_blocks, skipped_blocks,
+  kept_live_rows }` を返す(全行論理削除 block も skip)。
+- `crates/aruaru-server/src/columnar_pod.rs`: `GET /columnar/:table/prune
+  ?column=<c>&op=<gt|ge|lt|le|eq>&value=<v>`(`eq` は bloom 等値枝刈り)。
+- テスト: `prune_range_preview_skips_delta_blocks_that_cannot_match`,
+  `prune_equality_preview_uses_the_pk_bloom_filter`。
+
+### (c) A.6-3: 読み取り時の Raft index + MVCC SI 検証
+- `Applier` trait に `fn apply_at(&self, index: u64, cmd: &Command)
+  -> CommandResponse`(既定は `apply` へ委譲、`Arc<A>` blanket impl も
+  追加。既存の全 `Applier` 実装は無変更)。`RaftNode::apply_committed` が
+  `apply_at(idx, cmd)` を呼ぶ。
+- `ColumnarApplier` が `apply_at` を override し
+  `applied_index: AtomicU64` / `applied_commit_seq: AtomicU64` を記録
+  (`resp.ok` の場合のみ前進、`fetch_max`。`Command::Commit` で seq++)。
+- `read_at_index(table, required_index, required_commit_seq)`:
+  どちらか未達なら `Err(StaleRead { applied_*, required_* })`、
+  達していれば `HtapReplicaView { blocks, live_row_count, applied_* }`。
+  `0` を渡せばその条件は無条件(TiKV safe-ts / TiFlash の SI 検証相当)。
+- `columnar_pod.rs`: `GET /columnar/:table` に `appliedIndex` /
+  `appliedCommitSeq` を追加。`?required_index=&required_commit_seq=`
+  指定時は staleness 検証し、未達なら **409 CONFLICT** + stale 詳細。
+- テスト: `read_at_index_gates_on_applied_raft_index_and_commit_seq`。
+
+### (d) HLC `max_offset` クロックスキュー上限
+- `crates/aruaru-dist/src/hlc.rs`: `Hlc` に `max_offset_nanos: AtomicU64`
+  (`0` = 無効、既定)。`with_max_offset_nanos` / `set_max_offset_nanos` /
+  `max_offset_nanos()` アクセサ。
+- `try_update(remote, wall)` / `try_observe_ordinal(ord, wall)`:
+  `bucket(remote.pt) > bucket(wall) + max_offset` なら `Err(ClockSkew)`
+  (`Display` 実装あり)。permissive な `update` は上限超過リモートを
+  **無視してローカル進行のみ**(`self.now(wall)`、クロックを汚染しない)+
+  `tracing::warn!`。
+- `config::FollowerReadConfig` に `max_offset_ms: u64`(既定 0、動的)。
+  `reconcile.rs` の follower_read ブロックで
+  `state.hlc_handle().set_max_offset_nanos(ms * 1e6)` を反映。
+- `admin.rs::closed_ts_receive` が `observe_ordinal` →
+  `try_observe_ordinal` へ。遠すぎるリモート closed-ts は拒否 + warn。
+- `aruaru.example.yaml` の `follower_read` に `max_offset_ms: 0` を追記。
+- テスト: `max_offset_rejects_a_remote_timestamp_from_the_far_future`,
+  `max_offset_zero_disables_the_check_backward_compatible`。
+- **案A(パックをやめ物理/論理を 2 フィールドで運ぶ全面移行)は
+  `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として引き続き将来課題**
+  (P3 で GraphQL 化したばかりの API を再全面変更するため過大)。
+
+### 検証(ビルドまで)
+- `cargo test -p aruaru-dist -p aruaru-server` 失敗0
+  (aruaru-dist: hlc 15 / columnar_applier 14、aruaru-server: config 系
+  含め 13 passed / 1 ignored)。
+- `cargo test -p aruaru-graphql` 19 passed(`Applier` trait 変更の回帰無し)。
+- `cargo build --workspace` 成功(既存 `build_cluster`/`propose_commit`
+  未使用警告2件のみ、無関係)。
+- 実プロセス HTTP E2E はユーザー指示「ビルドまでで記録」により未実施
+  ——次回、`--columnar-learner` 2プロセス構成で `GET /columnar/:table
+  /prune`・`?required_index=` の 409・`follower_read.max_offset_ms` を
+  設定した `closed_ts_receive` 拒否を実 HTTP で確認する。
+
+### 復活用メッセージ(続き22 時点)
+続き22 で「🛑 復活用メッセージ」項目4 の (a)〜(d) はコード実装+
+ビルド/ユニットテストまで完了。→ **続き23 で E2E 確認 + GraphQL 公開まで完了**
+(下記)。
+
+## HANDOFF追記(2026-09-02続き23) `Query.htapReplicas` を GraphQL 単一
+サーフェスへ正式公開 + 続き22 (a)〜(d) の実 HTTP E2E
+
+**位置づけ**: 続き22 の「残り」2件——(2)`Query.htapReplicas` の GraphQL
+正式公開、(1)実 HTTP E2E——を実施。ユーザー指示「世界中の言語で Google/
+GitHub 調査を実装に活かし、実用的になるまで数回繰り返す」に沿って、
+まず TiFlash / CockroachDB の列/フォロワーレプリカ観測手法を WebSearch で
+調査してから設計した。
+
+### 調査(WebSearch)
+- **TiFlash**: `INFORMATION_SCHEMA.TIFLASH_REPLICA` に `PROGRESS`(0.0〜1.0、
+  1 = 少なくとも1レプリカが同期完了)と `AVAILABLE`(0/1)。「AVAILABLE=1 かつ
+  PROGRESS<1 なら列レプリカが TiKV から大きく遅延しており、pushdown した
+  クエリはタイムアウトしやすい」というガイダンス
+  (`docs.pingcap.com/.../information-schema-tiflash-replica`)。
+- **CockroachDB**: per-range の closed timestamp がフォロワーリードの根拠。
+  ただし「Raft 提案パイプラインの end-to-end レイテンシ観測は現状限定的」
+  という未解決課題(`github.com/cockroachdb/cockroach` issue #72393)。
+  → `htapReplicas` に applied-index / progress / availability を一度に
+  出すのは十分に価値がある、と判断。
+
+### 実装
+- **`aruaru-query::QueryEngine`**: `columnar_notify` スロット +
+  `set_columnar_observer(tx)`(`olap_notify` と独立、両方同時に配線可)。
+  `persist_row`/`persist_delete`/`persist_schema`/`persist_drop` の
+  `notify_olap_change` で変更テーブル名を両チャネルへ送る。
+- **`aruaru-dist::ColumnarApplier`**:
+  - `observing(shared_engine: Arc<QueryEngine>)` = 本番 `QueryEngine` を
+    **そのまま共有**する同居(co-located)オブザーバモード。行ストアの
+    ローカルミラーを二重に持たない。
+  - `observe_table(table)` → `replicate_table` を再利用して MoR ビューを追従。
+  - `replication_progress(table)`(TiFlash PROGRESS 相当、列レプリカ実効
+    行数 ÷ 行ストア行数、0 行は 1.0、クランプ 0..1)、
+    `replica_available(table)`(AVAILABLE 相当、1回でもレプリケート済みか)。
+- **`aruaru-server::main.rs`**: `aruaru.yaml: htap.columnar_replicas: true`
+  のとき同居 `ColumnarApplier` を構築 → `engine.set_columnar_observer(tx)` →
+  `tokio::spawn` で通知を受けて `observe_table`。`AdminCtx.columnar` へ共有。
+- **`aruaru-graphql`**: `AdminCtx.columnar: Option<Arc<ColumnarApplier>>`。
+  `Query.htapReplicas(table, pruneColumn, pruneOp, pruneValue)` →
+  `HtapReplicaStatusGql { table, available, progress, columnarBlockCount,
+  columnarLiveRowCount, deletionVectorPositions, appliedIndex,
+  appliedCommitSeq, replicationCount, prune }`。`pruneColumn`+`pruneValue`
+  指定時は `prune_range_preview`/`prune_equality_preview` を呼んで
+  `HtapPrunePreviewGql` を同梱。`admin(ctx)?` で認証。
+
+### 検証
+- `cargo test -p aruaru-graphql` **20 passed**(新規
+  `htap_replicas_query_reports_columnar_replica_progress_and_pruning`)、
+  `-p aruaru-dist` 101 / `-p aruaru-query` 60 / `-p aruaru-server` 13、
+  `cargo build --workspace` 成功。
+- **実 HTTP E2E(release、`htap.columnar_replicas: true` +
+  `max_offset_ms: 60000`)**:
+  - `/graphql` の `execSql` で `CREATE TABLE orders` + 5 `INSERT` →
+    同居オブザーバが自動追従(`replicationCount=6`)。
+  - `htapReplicas(table:"orders")` → `available=true`, `progress=1.0`,
+    `columnarBlockCount=6`(空 base + 5 delta), `columnarLiveRowCount=5`。
+  - `htapReplicas(..., pruneColumn:"amount", pruneOp:"gt",
+    pruneValue:"250")` → `totalBlocks=6`, `skippedBlocks=2`,
+    `keptLiveRows=3`。
+  - `DELETE FROM orders WHERE id=2` → 再観測で `columnarLiveRowCount=4`,
+    `deletionVectorPositions=1`(deletion vector 書き込み側が co-located
+    経路でも動く)。
+  - `htapReplicas(table:"ghost")` → `available=false`, `progress=0.0`。
+  - `/admin/closed-timestamp/receive` に `closed_timestamp:
+    9999999999999999999` → WARN `closed_ts_receive: rejected a remote
+    closed timestamp beyond max_offset`(HLC 汚染前に拒否)。
+
+### 残り
+1. `--columnar-learner` **真の別プロセス learner** での
+   `GET /columnar/:table/prune`・`?required_index=` の 409 実 HTTP
+   (同居モードでは applied_index は常に 0、staleness ゲートは学習器
+   プロセス用)。
+2. `htapReplicas` に「複数テーブル一括」「per-table availability 一覧」
+   (TiFlash の `TIFLASH_REPLICA` は全テーブル行を返す)。
+3. 復活用メッセージ項目5(`disaster_backup.email` reconcile)・項目6
+   (Tauri)・項目7(P4〜P6)。HLC 案A 全面移行(P-HLC-3)。
+
+**English summary**: `Query.htapReplicas` is now a first-class GraphQL query
+on the production `aruaru-server` (not just the `--columnar-learner`-only
+`columnar_pod.rs` HTTP). When `aruaru.yaml: htap.columnar_replicas: true`,
+the server builds a **co-located `ColumnarApplier`** that shares the
+production `QueryEngine` and follows writes via a new
+`QueryEngine::set_columnar_observer` channel (independent of the existing
+`olap_notify`). `htapReplicas` returns TiFlash `INFORMATION_SCHEMA.
+TIFLASH_REPLICA`-style `PROGRESS` (columnar live rows ÷ row-store rows,
+clamped 0..1) and `AVAILABLE`, plus applied Raft index / commit-seq and an
+optional pruning preview (`pruneColumn`/`pruneOp`/`pruneValue`). Design
+informed by a WebSearch pass over TiFlash's `PROGRESS`/`AVAILABLE` columns
+and CockroachDB issue #72393 ("per-range Raft-latency observability is
+currently limited"). Verified end-to-end over real HTTP `/graphql` (release
+build): `execSql` CREATE + 5 INSERT auto-followed (`replicationCount=6`),
+`available=true`/`progress=1.0`/`blockCount=6`/`liveRowCount=5`, prune
+`amount>250` → `skippedBlocks=2`/`keptLiveRows=3`, DELETE →
+`deletionVectorPositions=1`, unknown table → `available=false`, and a
+far-future `closed_ts_receive` value rejected before poisoning the HLC
+(`max_offset_ms=60000`). Remaining: the true separate-process
+`--columnar-learner` `?required_index=` 409 path, multi-table
+`htapReplicas`, and P-HLC-3 (HLC case-A full migration).
+
+## HANDOFF追記(2026-09-02続き24) `Query.htapReplicasAll`(全テーブル一覧)
+
+**位置づけ**: 続き23 の「残り」の1つ——`htapReplicas` の複数テーブル一括版
+——を実装。TiFlash の `INFORMATION_SCHEMA.TIFLASH_REPLICA` が全 (db, table)
+行を返すのと同じく、**テーブル名を知らなくても全列レプリカの同期状態を
+一覧できる**ようにするのが目的(監視サーフェスとしての実用性向上)。
+
+- `aruaru-dist::ColumnarApplier::replicated_tables() -> Vec<String>`
+  (`replica_state` のキー、ソート済み)を追加。
+- `aruaru-graphql`: `htapReplicas` / `htapReplicasAll` 共通の
+  `htap_status_for(columnar, table, prune)` ヘルパーへ切り出し
+  (per-table のステータス組み立てロジックの重複を排除)。
+  `Query.htapReplicasAll -> [HtapReplicaStatusGql]`(prune プレビューは
+  含めない。列レプリカ無効なら空配列)。`admin(ctx)?` で認証。
+- テスト: `htap_replicas_query_reports_columnar_replica_progress_and_pruning`
+  を拡張——2 テーブル目(`a_first`)を足すと `htapReplicasAll` が
+  ソート順で両方(`a_first`, `m`)を返し、いずれも `available=true`。
+- 検証: `cargo test -p aruaru-graphql` **20 passed** / `-p aruaru-dist`
+  **101 passed**、`cargo build --workspace` 成功。
+
+### 残り(続き24 時点)
+1. `--columnar-learner` **真の別プロセス learner** での
+   `GET /columnar/:table/prune`・`?required_index=` の 409 実 HTTP
+   (同居モードでは applied_index は常に 0)。
+2. 復活用メッセージ項目5(`disaster_backup.email` reconcile、feature
+   ゲート)・項目6(Tauri)・項目7(P4〜P6)。
+3. HLC 案A 全面移行(`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3)。
+4. open-cuda: Hopper/Ada 実機での `sgemm_fp8_weight_vendor` 実装、
+   AWQ 実配布モデルでの E2E。
+
+**English summary**: added `Query.htapReplicasAll`, the multi-table version
+of `htapReplicas`. Like TiFlash's `INFORMATION_SCHEMA.TIFLASH_REPLICA`
+(one row per (db, table)), it lets you list the sync state of *every*
+columnar replica without knowing table names — useful as a monitoring
+surface. `ColumnarApplier::replicated_tables()` returns the sorted
+`replica_state` keys; a shared `htap_status_for` helper removes the
+per-table status-building duplication; `htapReplicasAll` returns
+`[HtapReplicaStatusGql]` (no pruning preview; empty when the feature is
+off). Test extended: adding a second table (`a_first`) makes
+`htapReplicasAll` return both in sorted order, both `available=true`.
+`cargo test -p aruaru-graphql` 20 passed / `-p aruaru-dist` 101 passed,
+`cargo build --workspace` OK. Remaining: the true separate-process
+`--columnar-learner` `?required_index=` 409 path; `disaster_backup.email`
+reconcile; Tauri; P4–P6; HLC case-A (P-HLC-3); open-cuda Hopper/Ada FP8
+vendor GEMM.
+
+## HANDOFF追記(2026-09-02続き25) 残タスク消化: (1) 真の別プロセス learner の E2E、(2a) `disaster_backup.email` reconcile 配線
+
+### (1) `--columnar-learner` **真の別プロセス learner** の実 HTTP E2E(検証・バグ無し)
+
+続き23 で「同居モードでは `applied_index` は常に 0、staleness ゲートは
+学習器プロセス用」と残していた分を、実際に 2 プロセス起動して確認した。
+
+- leader(`--raft-id 1 --learner-peers "2@127.0.0.1:18081"`、単一 voter=
+  quorum 1)+ columnar learner(`--raft-id 2 --raft-role learner
+  --peers "1@..." --columnar-learner --gql-port 18081`)を release バイナリで起動。
+- leader へ `POST /admin/cluster/propose` で `CREATE TABLE gear` + 5 `INSERT`
+  → RaftWriter 経由 commit → **バイナリトランスポート**で learner へ複製。
+- learner の `columnar_pod` を実 HTTP:
+  - `GET /columnar/gear` → `appliedIndex=6`(**同居モードの 0 と違い、
+    `apply_at` が実 Raft ログインデックスを記録**)、`replicationCount=6`、
+    `columnarBlockCount=6`、`columnarLiveRowCount=5`。
+  - `GET /columnar/gear/prune?column=qty&op=gt&value=25` → `skippedBlocks=2`、
+    `keptBlocks=4`、`keptLiveRows=3`。
+  - `GET /columnar/gear?required_index=99999` → **409** +
+    `{"stale":true,"appliedIndex":6,"requiredIndex":99999}`。
+  - `GET /columnar/gear?required_index=6` → **200** `{"stale":false}`。
+  - `DELETE FROM gear WHERE id=3` → 複製され `columnarDeletionVectorPositions=1`、
+    `columnarLiveRowCount=4`。
+- ログにエラー・パニック無し(無関係な DB-Engines クロール失敗 WARN のみ)。
+  **バグは見つからなかった**——`apply_at` の Raft index 記録・409 staleness
+  ゲート・deletion vector 書き込み側が真の別プロセス learner で機能する
+  ことを実証した。
+
+### (2a) `disaster_backup.email` の reconcile 配線(`feature = "disaster_email_backup"`)
+
+宣言的設定「メールアドレスひとつ」でディザスタ退避を有効化する。復活用
+メッセージ項目5 の前半。
+
+- `config::reconcile` に `#[cfg(feature = "disaster_email_backup")]` ブロックを
+  追加。`new.disaster_backup`(前回適用分と `PartialEq` 比較で冪等判定)で
+  変化を検知し、`enabled=true` かつ必須7フィールドが揃っていれば
+  `DisasterEmailBackupConfig` を構築 →
+  `AdminState::set_disaster_email_backup`(新設、REST ハンドラと共通経路)で
+  保管 + 稼働中 `RaftWriter` へ注入。必須フィールド欠落は warn のみで無効
+  継続。`enabled` を false へ戻した場合は「稼働中経路からの取り外しは
+  未対応(要再起動)」と warn。
+- `aruaru-dist::DisasterEmailBackupConfig::from_parts(...)` を追加
+  (`aruaru-server` が `open_raid_z_core::EmailBackupTargetConfig` を直接
+  名前参照せずに済む)。
+- `ReconcileReport` に `disaster_backup_changed: bool`。
+- `admin.rs` の `set_disaster_email_backup` REST ハンドラを共通経路
+  `AdminState::set_disaster_email_backup` 経由へリファクタ。
+- **ついでに pre-existing バグ修正**: `disaster_email_backup` feature 配下の
+  REST ハンドラ 2 本の `check_admin_auth(req)` が 1 引数のままで、
+  `KeyGuardian` 引数追加以降コンパイル不能だった(feature が CI に無く
+  露見していなかった)。`check_admin_auth(req, &state.keyring)` へ是正。
+- `aruaru.example.yaml` の `disaster_backup` コメントを更新。
+- テスト: `disaster_backup_email_reconcile_wires_config_and_is_idempotent`
+  (初回で `disaster_backup_changed`、同一再適用で不変、必須欠落で不変)。
+
+### 検証
+- 既定ビルド: `cargo test -p aruaru-server` 13 passed、
+  `cargo build --workspace` 成功。
+- feature ビルド: `cargo test -p aruaru-server -p aruaru-dist
+  --features disaster_email_backup` → aruaru-server **14 passed** /
+  aruaru-dist **108 passed**(いずれも 1 ignored)。
+
+### 未着手(ハードウェア/前提の制約で不可、正直な開示)
+- **HLC 案A 全面移行(P-HLC-3)**: P3 で GraphQL 化したばかりの API を
+  物理/論理 2 フィールドで運ぶ形へ再全面変更する大改修。過大なため
+  引き続き `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として保留。
+- **open-cuda Hopper/Ada `sgemm_fp8_weight_vendor` 実装**: NVIDIA H100/
+  RTX40 世代 + cuBLASLt FP8 が必要。この開発機は GT 730(Kepler、Tensor
+  Core 無し)のため**実装・検証とも不可能**。能力フラグ
+  (`supports_fp8_tensor_core`)+ スタブ + ソフトウェアフォールバックまでが
+  この環境で正直に到達できる範囲。
+- **AWQ 実配布モデルでの E2E**: AWQ は Llama/Mistral/Qwen 系が対象で、
+  GPT-2 アーキテクチャ(`Conv1D`)の AWQ 公開モデルは事実上存在しない。
+  `open-cuda-llm::GptModel` は GPT-2 のみロード可のため、実 AWQ モデルでの
+  E2E は現実的に不可。合成 interleaved-4bit テンソルの厳密一致テストが
+  この loader の検証上限。
+
+### 残り(次回)
+1. 復活用メッセージ項目5 の後半 / 項目6(Tauri)・項目7(P4〜P6)。
+2. HLC 案A 全面移行(P-HLC-3)。
+3. Hopper/Ada 実機が入手できた場合の open-cuda FP8 ベンダー GEMM。
+
+**English summary**: Two remaining next-phase items cleared. **(1)** The true
+separate-process `--columnar-learner` path was verified end-to-end over real
+HTTP: a leader (`POST /admin/cluster/propose`) replicates via the binary
+transport to a learner process whose `columnar_pod` now reports a **real
+Raft log index** (`appliedIndex=6`, vs always 0 in co-located mode) because
+`apply_at` records it; `?required_index=99999` returns **409**
+(`stale:true`), `?required_index=6` returns 200, pruning
+(`skippedBlocks=2`) and the deletion vector (`deletionVectorPositions=1`
+after DELETE) all work. No bugs found. **(2a)** `disaster_backup.email` is
+now wired into `config::reconcile` (feature `disaster_email_backup`): a
+declarative `aruaru.yaml` block, when `enabled` with all 7 fields, builds a
+`DisasterEmailBackupConfig` and injects it into the live `RaftWriter` via a
+new shared `AdminState::set_disaster_email_backup` (also used by the REST
+handler); idempotent via `PartialEq`; missing fields → warn only. Fixed a
+**pre-existing compile break**: the two `disaster_email_backup`-gated REST
+handlers still called `check_admin_auth(req)` (1-arg) — never compiled since
+`KeyGuardian` was added, since the feature isn't in CI — now
+`check_admin_auth(req, &state.keyring)`. Tests: default `cargo test -p
+aruaru-server` 13, `cargo build --workspace` OK; feature build `cargo test
+-p aruaru-server -p aruaru-dist --features disaster_email_backup` → 14 / 108
+passed. **Still blocked (honestly)**: HLC case-A full migration (P-HLC-3,
+over-churn); open-cuda Hopper/Ada `sgemm_fp8_weight_vendor` (needs H100/RTX40
++ cuBLASLt FP8 — this box is a GT 730); AWQ real-model E2E (no public
+GPT-2-architecture AWQ models exist).
+
+## HANDOFF追記(2026-09-03続き26) HLC P-HLC-3 = 案A 全面移行(内部フル精度 2 フィールド + 外向き u64 互換維持)
+
+**位置づけ**: 復活用メッセージ項目4(d)・§5 で「案A への全面移行は過大」と
+していた HLC 案A を、ユーザー指示「世界中の言語で Google/GitHub を調査し
+最新理論を新規設計書に活かしてから実装、実用的になるまで数回反復」に
+沿って実施した。
+
+### 追加の一次資料調査(2026-09、英語。`docs/HLC_TIMESTAMP_REDESIGN.md` §6.1)
+- **CockroachDB `util/hlc`**: `Timestamp { WallTime int64(Unix ナノ秒、
+  フル精度), Logical int32, Synthetic bool }` を**パックせず別フィールド**。
+  順序 `(WallTime, Logical)` 辞書式。`max_offset` 既定 500ms。uncertainty
+  interval `[commit_ts, commit_ts + max_offset]`。物理時刻を先食いした
+  timestamp は `Synthetic=true`。クロックは `sync.Mutex`。
+- **uhlc-rs**(Zenoh): `NTP64`(64bit、下位 4bit を論理カウンタで置換
+  ≒3.5ns 分解能)。`update_with_timestamp` は incoming が現在の物理時刻 +
+  delta(既定 500ms)を超えたら **`Err`**。`Mutex` 保護。
+- **論文** arXiv:1808.05698(Raft + HLC): 書き込みの直列化点で単調前進、
+  フォロワーは受信 HLC で `update`。
+- **学び**: 業界主流は (a) 物理をフル精度で別フィールド、(b) `Mutex` 保護
+  (案B のロックフリー CAS は 65µs 粒度という妥協の裏返し)、(c) skew 上限で
+  incoming を `Err`。
+
+### 新設計(案A、低 churn 移行)
+- 内部 `HlcTimestamp { wall_nanos: u64(切り捨て無し), logical: u32,
+  synthetic: bool }`。順序 = `(wall_nanos, logical)` 辞書式。
+  **シフト・パックが無いので u64 オーバーフローは構造的に不可能**。
+- `Hlc` は `parking_lot::Mutex` 保護(CockroachDB / uhlc-rs と同じ)。
+- **外向き u64 互換を維持**: `as_ordinal()` は案B の 65µs 射影(logical
+  >0xFFFF は上位バケットへ桁上げ)。`Hlc` が `last_ordinal` を記憶し
+  `now_ordinal()` は常に厳密単調(射影のロスで逆転しかけたら
+  `last_ordinal + 1` へクランプ)。`now_ordinal` / `observe_ordinal` /
+  `try_observe_ordinal` / `from_ordinal` は**互換シグネチャ維持** →
+  `closed_ts` / `wal_service` / GraphQL `closedTsAdvance` は一切変更不要。
+- 新 API(既存を非推奨にしない): `now_hlc` / `now_hlc_sys` / `observe_hlc`
+  (フル精度)、`HlcTimestamp::uncertainty_upper(max_offset)` = CockroachDB の
+  uncertainty interval 上端 `wall_nanos + max_offset`。
+- `ClockSkew` フィールドを `remote_wall_nanos` / `local_wall_nanos` へ改名。
+  skew 判定はフル精度ナノ秒の正確な比較(案B の 65µs 丸め無し)。
+
+### 実装
+- `crates/aruaru-dist/src/hlc.rs` 全面書き換え(21 テスト、うち新規:
+  フル精度ナノ秒が切り捨てられないこと、synthetic フラグの意味、案B 射影の
+  16bit 桁上げ、`now_ordinal` の last_ordinal クランプ、`observe_hlc` の
+  フル精度往復、`uncertainty_upper`、eq/ord が synthetic を無視すること)。
+- `aruaru-graphql`: `Query.hlcNow { wallNanos logical synthetic ordinal
+  maxOffsetMs uncertaintyUpperNanos }`(観測専用、P-HLC-3b)+
+  `HlcNowGql` 型 + テスト。
+- `docs/HLC_TIMESTAMP_REDESIGN.md` §6 に調査・新設計・フェーズを追記。
+
+### 検証
+- `cargo test -p aruaru-dist hlc::` 21、`-p aruaru-graphql` 21、
+  `-p aruaru-server` 13、`cargo build --workspace` 成功、
+  clippy(hlc.rs / graphql)警告0。
+- **実 HTTP E2E(release、`follower_read.max_offset_ms: 500`)**:
+  - `hlcNow` #1 → `wallNanos: "1788408257477589700"`(**17 桁のフル精度
+    Unix ナノ秒**、truncated ordinal ではない)、`synthetic: false`、
+    `ordinal: "1788408257477541888"`(案B 65µs 射影、下位 16bit マスク)、
+    `maxOffsetMs: 500`、`uncertaintyUpperNanos: "1788408257977589700"`
+    (= wallNanos + 5e8、正確)。
+  - `hlcNow` #2 → `wallNanos` も `ordinal` も #1 より厳密増加。
+  - `closedTsAdvance`(`nowNanos` 省略 → `hlc.now_ordinal()`)→ 従来どおり
+    有効な ordinal を返す(**後方互換 intact**)。
+- 案A 全面移行はこれで**完了扱い**(内部は完全に案A、外向き u64 は
+  後方互換の射影)。
+
+### 残り
+1. `closed_ts` の follower read staleness 判定を `uncertainty_upper`
+   ベースへ(CockroachDB の uncertainty interval、P-HLC-3c、closed_ts の
+   設計トラック。今回はやらない)。
+2. 復活用メッセージ項目5(`disaster_backup.email` は続き25 で reconcile
+   配線済み。残りは Tauri 設定タブ等)・項目6・項目7(P4〜P6)。
+
+**English summary**: HLC "case-A" full migration is done. After an
+additional primary-source pass (CockroachDB `util/hlc` keeps `WallTime
+int64` + `Logical int32` + `Synthetic bool` as **unpacked separate
+fields** under a `sync.Mutex`; uhlc-rs likewise uses a `Mutex` and
+returns `Err` when an incoming timestamp exceeds wall + delta), the
+internal representation is now `HlcTimestamp { wall_nanos: u64
+(full-precision, no truncation), logical: u32, synthetic: bool }` ordered
+lexicographically by `(wall_nanos, logical)` — **no shift, no packing, so
+the u64 overflow of the original design is structurally impossible**.
+`Hlc` is now `parking_lot::Mutex`-guarded (the lock-free CAS of case-B was
+the flip side of its 65µs-granularity compromise). The **external u64
+ordinal wire format is unchanged**: `as_ordinal()` projects to the
+case-B 65µs ordinal (carrying past 16 bits when logical overflows), and
+`Hlc` remembers `last_ordinal` so `now_ordinal()` stays strictly
+monotonic; `now_ordinal` / `observe_ordinal` / `try_observe_ordinal` /
+`from_ordinal` keep their signatures, so `closed_ts` / `wal_service` /
+GraphQL `closedTsAdvance` need **zero changes**. New API alongside:
+`now_hlc` / `observe_hlc` (full precision) and
+`HlcTimestamp::uncertainty_upper(max_offset)` (CockroachDB's uncertainty
+interval upper bound). GraphQL `Query.hlcNow` added for observability.
+Verified end-to-end over real HTTP (release): `hlcNow` returns a 17-digit
+full-precision Unix-nanosecond `wallNanos` (not a truncated ordinal), two
+successive calls strictly increase both `wallNanos` and `ordinal`,
+`uncertaintyUpperNanos == wallNanos + 500ms`, and `closedTsAdvance` (with
+`nowNanos` omitted) still works unchanged. `cargo test`: aruaru-dist hlc
+21 / aruaru-graphql 21 / aruaru-server 13; `cargo build --workspace` OK;
+clippy clean. Case-A migration is complete (internals fully case-A, the
+external u64 is a backward-compatible projection). Remaining: rebase the
+`closed_ts` follower-read staleness check onto `uncertainty_upper`
+(P-HLC-3c, a separate closed_ts track).
+
+## HANDOFF追記(2026-09-03続き27) P-HLC-3c(follower read staleness を uncertainty interval へ)+ P-HLC-3d(HLC 射影からシフト・パック・切り捨てを完全撤去)
+
+**位置づけ**: 続き26 が「残り」筆頭に挙げていた P-HLC-3c を実施。加えて
+ユーザー指摘「シフト・パックが無い?」——続き26 まででも `HlcTimestamp::
+as_ordinal()` に案B の `& !0xFFFF` バケット射影が残り、`advance_locked` も
+バケット分岐していた(内部状態機械にシフト・パックの残滓)——を受け
+**P-HLC-3d** としてこれを完全撤去した。正本 `docs/HLC_TIMESTAMP_REDESIGN.md`
+§6.5 に P-HLC-3c(2026-09-03 実施)・P-HLC-3d(同)を追記。
+
+### P-HLC-3c: `closed_ts` の follower read を uncertainty interval へ
+- **`crates/aruaru-dist/src/closed_ts.rs`**:
+  - `ClosedTimestampTracker::can_serve_uncertainty_safe_read_at(read_ts,
+    max_offset_nanos)` = `read_ts != 0 && read_ts + max_offset <=
+    closed_ts`。uncertainty interval `[read_ts, read_ts + max_offset]` の
+    **全域**が閉じ済みであることを要求 ——満たせば uncertainty restart が
+    構造的に発生し得ない(CockroachDB `follower_read_timestamp()` が
+    `target_lag >= max_offset` を選ぶのと同じ保証を明示判定に)。
+    `max_offset == 0` は `can_serve_read_at` と同値。
+  - `ClosedTimestampCoordinator::plan_uncertainty_safe_read(range_ids,
+    now, staleness, max_offset)` ——`read_ts = now - staleness` を先に
+    固定し全 Range が上記述語を満たすときだけ `FollowerRead`。
+    `max_offset == 0` は `plan_exact_staleness_read` へ**委譲**(後方互換、
+    `RouteToLeaseholder` の reason 文字列まで一致)。
+- **`crates/aruaru-graphql/src/admin_resolvers.rs`**: `planFollowerRead`
+  に `mode: "uncertainty-safe"`(別名 `uncertainty_safe`)を追加。
+  `max_offset` は共有 `AdminCtx.hlc` の `max_offset_nanos()` から取得。
+
+### P-HLC-3d: 射影からシフト・パック・切り捨てを撤去
+- **`as_ordinal()` = `wall_nanos.saturating_add(logical as u64)`**。
+  左シフトもマスクもバケットも無い。`logical`(物理停止中の同一ナノ秒内
+  追加イベント数、通常 0〜数個、`max_offset` で有界)をナノ秒空間へ
+  そのまま加算するだけ → `closed_ts` 等が受け取る u64 は**フル精度の
+  Unix ナノ秒スケール**(§3「案B の代償」= 65µs 粒度は消滅)。
+- **`advance_locked` はバケット概念を撤廃**: `wall_now > st.wall_nanos`
+  なら `(wall_now, 0)`、そうでなければ `logical += 1` + `synthetic`
+  ——CockroachDB `hlc.go` `Now()` とビット単位で同じ。
+- **`from_ordinal(o)` = `{ wall_nanos: o, logical: 0, synthetic: true }`**
+  (物理成分をそのまま復元。u64 経路で畳み込まれた `logical` 端数は失うが、
+  フル精度が要る所は `observe_hlc` = 構造体をそのまま渡す新 API)。
+- u64 の**厳密単調**は従来どおり `Hlc.last_ordinal` クランプで保証。
+- `ORDINAL_LOGICAL_BITS` / `ORDINAL_BUCKET_MASK` / `ordinal_bucket()` 削除。
+- `now_ordinal` / `observe_ordinal` / `try_observe_ordinal` / `closed_ts` /
+  `wal_service` / GraphQL `closedTsAdvance` のシグネチャ・配線は**無変更**
+  (u64 の意味が「65µs 射影」→「フル精度ナノ秒 + logical 畳み込み」へ
+  厳密化されただけ。persisted ordinal は無く互換性問題なし)。
+
+### 検証
+- `cargo test -p aruaru-dist hlc::` **21 passed**(P-HLC-3d に合わせて
+  `as_ordinal_*` / `now_*` 系テストを「ordinal == wall_nanos + logical、
+  シフト・マスク無し」へ書き換え)。`closed_ts::` **9 passed**(新規
+  `uncertainty_safe_read_requires_closed_ts_to_cover_the_uncertainty_interval`)。
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`:
+  **dist 108 / graphql 22 / server 13 passed**、`cargo build --workspace`
+  成功(既存 `build_cluster`/`propose_commit` 警告のみ)。clippy は
+  hlc.rs / closed_ts.rs に新規指摘なし(既存の identity_op 等のみ)。
+- **実 HTTP E2E(release、`follower_read.max_offset_ms: 500`)**:
+  起動ログ `aruaru.yaml: follower_read.max_offset_ms を HLC へ反映しました
+  max_offset_ms=500`。
+  - `hlcNow` → `wallNanos == ordinal`(**完全一致**、`1788412243861359300`
+    の 17 桁。案B なら下位 16bit がマスクされ両者は乖離していた)、
+    `uncertaintyUpperNanos == wallNanos + 500_000_000`、`maxOffsetMs=500`。
+    2 連続で `ordinal` 厳密増加。
+  - `closedTsRegisterRange(1)` → `closedTsAdvance(nowNanos:"20000000000")`
+    → `closedTimestamp="17000000000"`(20s − 3s target_lag)。
+  - `planFollowerRead(rangeIds:[1], mode:"uncertainty-safe",
+    nowNanos:"20000000000", stalenessNanos:"1000000000")` → read_ts=19s、
+    uncertainty 上端 19.5s > closed 17s → `plan="route_to_leaseholder"`
+    (reason: "closed timestamp does not yet cover the read's uncertainty
+    interval")。
+  - `stalenessNanos:"4000000000"` → read_ts=16s、上端 16.5s <= 17s →
+    `plan="follower_read"`、`readTimestamp="16000000000"`。
+  - ログにエラー・パニック無し(無関係な DB-Engines クロール WARN のみ)。
+
+### 残り
+1. 復活用メッセージ項目5(Tauri 設定タブの `aruaru.yaml` 編集 UI 化)・
+   項目6・項目7(P4〜P6)。
+2. HLC `max_offset` スキュー上限を permissive `update` 全経路へ広げる検討
+   (現状は `try_update`/`try_observe_ordinal` のみ厳格、`update` は
+   リモート無視でローカル進行のみ)。
+
+**English summary**: **P-HLC-3c** — `ClosedTimestampTracker::
+can_serve_uncertainty_safe_read_at(read_ts, max_offset)` requires the
+**entire** uncertainty interval `[read_ts, read_ts + max_offset]` to be
+closed; `ClosedTimestampCoordinator::plan_uncertainty_safe_read` gates
+every range on it (`max_offset == 0` delegates to
+`plan_exact_staleness_read`, byte-for-byte backward compatible). GraphQL
+`planFollowerRead(mode: "uncertainty-safe")` reads `max_offset` from the
+shared HLC. **P-HLC-3d** — removed the last shift/pack from the ordinal
+projection (the user asked "no shift/pack?"): `as_ordinal()` is now
+`wall_nanos + logical` (no `<<`, no `& !0xFFFF`, no bucket concept in
+`advance_locked` — bit-for-bit CockroachDB `hlc.go` `Now()`), so the
+`u64` that `closed_ts`/`wal_service`/`closedTsAdvance` carry is now
+**full-precision Unix-nanosecond scale** — the case-B 65µs granularity
+cost is gone. `from_ordinal` = `{ wall_nanos: o, logical: 0, synthetic:
+true }`; strict monotonicity still comes from the `Hlc.last_ordinal`
+clamp; the `ORDINAL_*` constants and `ordinal_bucket()` are deleted; no
+signature or wiring changes anywhere else (no persisted ordinal, so no
+compat break). Tests: hlc 21 / closed_ts 9 / full sweep dist 108 /
+graphql 22 / server 13, `cargo build --workspace` OK, clippy no new
+findings. Real HTTP E2E (release, `max_offset_ms: 500`): `hlcNow` returns
+`wallNanos == ordinal` exactly (17-digit `1788412243861359300` — case-B
+would have masked the low 16 bits), `uncertaintyUpperNanos == wallNanos +
+500ms`; after `closedTsAdvance(now=20s)` (closed=17s),
+`stalenessNanos=1s` → `route_to_leaseholder` (uncertainty not covered),
+`stalenessNanos=4s` → `follower_read` `readTimestamp=16000000000`.
+
+## HANDOFF追記(2026-09-03続き28) クライアント接続ガイド `docs/CLIENTS.md` + `clients/` コネクタキット新設 / 管理インストーラ名を規則へ
+
+ユーザー指示「aruaru-db を Java / Rust+Axum・Poem・RPoem / Python+FastAPI /
+PHP+Laravel など主要言語・フレームワークに対応、Windows/Mac/Linux/UNIX/
+メインフレーム/Android/iOS/iPad の "デバイスドライバ" も用意、同期/非同期/
+ハイブリッド、速度を犠牲にせず互換」。
+
+### 判断(正直な設計上の結論、コード資産を増やさない方が正解)
+aruaru-db は **pgwire(:5433)+ GraphQL/HTTP(:4001)** の 2 標準契約
+だけを公開する。どの言語も**その言語の標準 PostgreSQL ドライバ**(JDBC /
+asyncpg / psycopg / PDO_pgsql / pgx / node-postgres / Npgsql / ruby-pg)で
+そのまま繋がり、独自ドライバは要らない・作らない:
+- `<repo>-<言語>-<OS>-device-driver-installer.exe` は**作らない**
+  ——デバイスドライバではなくネットワークサービスのクライアントであり、
+  成熟した監査済みドライバの再実装は「闇雲な代替を避ける」原則に反する。
+  独自変換層を挟めば速度も 1 段**遅くなる**。
+- 同期/非同期はワイヤ上は同一(クライアントの I/O モデルの違いのみ)。
+  ハイブリッドは Npgsql / pgx / JDBC+仮想スレッド / psycopg3 の sync+async
+  両 API を選ぶだけ。OS 差は「TCP+TLS が張れるか」に閉じる。
+- 配布物名が要るなら `aruaru-db-<言語>-connector`(`clients/<スタック>/`
+  のサンプル一式)。`.exe` device-driver installer は無し。
+
+### 成果物
+- **`docs/CLIENTS.md`(日英、正本)**: 2 契約の説明 / 「独自ドライバ不要」の
+  理由 / 言語 × フレームワーク × 同期非同期の早見表 / 接続文字列(libpq・
+  JDBC・R2DBC・GraphQL)/ Java・Rust・Python・PHP・Go・Node・.NET・Ruby の
+  レシピ(接続 → SELECT → `aruaru_commit` → `AS OF COMMIT`)/ OS 別
+  ドライバ入手表(Windows/macOS/Linux/UNIX〈Solaris/AIX/*BSD〉/z/OS
+  メインフレーム/Android/iOS・iPadOS)/ 拡張プロトコル対応状況
+  (`describe_portal` は 2026-07-14 修正済み)/ 検証状況。
+- **`clients/`**: `README.md` + `python-fastapi/`(asyncpg 非同期)・
+  `rust-axum/`(sqlx PgPool、Poem/RPoem も同じ `PgPool`)・
+  `php-laravel/`(PDO_pgsql 同期・Laravel `.env`)・`java-jdbc/`(素の
+  JDBC 同期 + R2DBC 非同期コメント + Spring/Quarkus 設定行)。各
+  `README.md` に「検証済み/未検証」を明記(この環境に各ドライバ未導入の
+  ため本セッションはライブ往復未検証。過去に sqlx/`psql` の pgwire 往復は
+  検証済み〈2026-07-13/14〉)。
+
+### 管理インストーラ名
+`aruaru-admin/aruaru-db-admin-win/installer/setup.nsi` の `OutFile` を
+`aruaru-db-admin-setup-${APP_VERSION}.exe` → **`aruaru-db-admin-win-installer.exe`**
+(バージョン番号なし、ecosystem 命名規則)へ。README も追従。
+リポジトリ主インストーラ `aruaru-db-installer.exe`(`installer/windows/
+aruaru-db.iss`)は既に規則どおり(変更なし)。open-cuda/open-directx/
+dream-os は Windows インストーラを持たない(ライブラリのため該当なし)。
+
+### 検証
+`cargo` 変更なし(ドキュメント + サンプル + nsi 文字列のみ)。
+`docs/CLIENTS.md` の SQL レシピは各エコシステム標準ドライバの標準用法。
+
+### 次
+Go / Node / .NET のサンプルディレクトリ実体(現状はレシピのみ)、
+各言語ドライバを実際に導入してのライブ往復検証、iOS の `PostgresNIO`
+サンプル。
+
+**English**: Added `docs/CLIENTS.md` (JA+EN, source of truth) + a
+`clients/` connector kit. Decision: aruaru-db speaks **pgwire (:5433) +
+GraphQL/HTTP (:4001)** only; every language connects with its **standard
+PostgreSQL driver** (JDBC / asyncpg / psycopg / PDO_pgsql / pgx /
+node-postgres / Npgsql / ruby-pg) — no custom driver, and we do **not**
+build `<repo>-<lang>-<os>-device-driver-installer.exe` artifacts (not
+device drivers; re-implementing mature audited drivers violates the
+"avoid blind replacements" principle and would *add* a layer of
+overhead). Sync vs async is identical on the wire; hybrid = pick a
+driver that offers both (Npgsql / pgx / JDBC+virtual-threads / psycopg3).
+If a distributable name is needed it is `aruaru-db-<lang>-connector` =
+the `clients/<stack>/` samples. `docs/CLIENTS.md` covers language ×
+framework × sync/async recipes (connect → SELECT → `aruaru_commit` →
+`AS OF COMMIT`), a per-OS driver-acquisition table
+(Windows/macOS/Linux/UNIX/IBM z/OS mainframe/Android/iOS/iPadOS), and the
+extended-protocol status. `clients/` ships runnable
+`python-fastapi/` (asyncpg), `rust-axum/` (sqlx PgPool; Poem/RPoem use
+the same pool), `php-laravel/` (PDO_pgsql), `java-jdbc/` (plain JDBC +
+R2DBC notes), each README marking verified/not-yet-verified. Also renamed
+the admin GUI installer output to `aruaru-db-admin-win-installer.exe`
+(fixed name, ecosystem rule); the main `aruaru-db-installer.exe` already
+follows the rule; open-cuda/open-directx/dream-os ship no Windows
+installer (libraries). No `cargo` changes.
+
+## HANDOFF追記(2026-09-03続き29) 公式 Rust コネクタ `aruaru-db-connector` を新設(コードあり・テスト green)+ RPoem/Poem での使い方
+
+ユーザー質問「実体のあるコネクタ層(Git-on-SQL の commit()/as_of() を
+慣用 API で薄くラップ)は作れるか」「RPoem で動かすデバイスドライバは
+Rust 用か Poem 用か」への対応。
+
+### 新規クレート `clients/rust-aruaru-db/`(独立、メインワークスペース外)
+`aruaru-db-connector` v0.1.0。**独自ドライバではない**——業界標準の
+`tokio-postgres` をそのまま使い、その上に薄い API を足すだけ:
+- `AruaruDb::connect(dsn)`(接続タスクを `tokio::spawn`)/ `from_client` /
+  `client()`(透過)/ `execute` / `query`(薄い透過)。
+- `commit(message) -> String` = `SELECT aruaru_commit($1)`。
+- `query_as_of(base_select, commit_id, params)` = `base_select` 末尾へ
+  ` AS OF COMMIT '<id>'` を**安全に**付与。`is_safe_commit_id`(英数字 +
+  `-` `_`、≤128 文字)で検証し、非安全なら `Error::InvalidCommitId`
+  (SQL インジェクション防止、ネットワークに触れる前に弾く)。
+  `query_as_of_opt` は 0/1 行版。
+- 依存は `tokio-postgres` + `tokio` のみ(オフラインビルド可)。
+- テスト: `safe_commit_id_accepts_hashes_and_uuids_rejects_sql` /
+  `query_as_of_rejects_unsafe_commit_id_before_touching_the_network` +
+  doctest。**`cargo test` = 2 passed / 1 ignored + doctest 1 passed**
+  (ネットワーク不要ぶんはこのセッションで green)。実サーバ往復
+  `live_commit_and_as_of_round_trip` は `ARUARU_DB_TEST_DSN` 指定時のみ
+  走る `#[ignore]`(この環境に稼働 server 無しで未実施)。
+
+### RPoem / Poem での「デバイスドライバ」
+**「Poem 用ドライバ」は存在しないし要らない。** RPoem
+(`open-runo-poem-compat`)は Web フレームワークで DB クライアントを指定
+しない。RPoem アプリ → aruaru-db は **Rust の非同期 PostgreSQL
+クライアント**で繋ぐ。選択肢(`docs/CLIENTS.md` §3.8b に表):
+- `aruaru-db-connector`(上記、Git-on-SQL を慣用 API で)
+- `tokio-postgres` 生 / `sqlx`(`postgres`,`runtime-tokio`、`PgPool`)
+- `open-runo-db::aruaru::AruaruDbBackend`(RPoem 同梱、put/get/delete/list
+  の**汎用 KV のみ**。`aruaru_commit`/`AS OF COMMIT` 未対応)
+RPoem は `Data<T>` 抽出子が無いので `Arc<AruaruDb>` をハンドラ登録
+クロージャで `Arc::clone` キャプチャ(2026-07-31 の aruaru-llm RPoem
+移行と同じ)。**互換性**: pgwire は拡張プロトコル込みで PostgreSQL 互換
+(`describe_portal` 2026-07-14 修正済み)なので `tokio-postgres`/`sqlx`
+はそのまま動く——**新規開発は不要**、`aruaru-db-connector` は「あると
+便利」層。
+
+### 次
+`aruaru-db-connector` の実サーバ往復検証(稼働 server を立てて
+`--ignored` を実行)、TLS 版(`tokio-postgres-rustls`)、他言語の
+同種の薄いラッパー(Python `aruaru_db` / Node `@aruaru/db` 等)を作るか
+の判断。
+
+**English**: Added `clients/rust-aruaru-db/` — `aruaru-db-connector`
+v0.1.0, a **thin wrapper** (not a custom driver) over standard
+`tokio-postgres` adding `commit(message) -> String`
+(`SELECT aruaru_commit($1)`) and `query_as_of(base_select, commit_id,
+params)` which safely appends ` AS OF COMMIT '<id>'` after validating the
+id with `is_safe_commit_id` (alnum + `-`/`_`, ≤128) — rejecting unsafe
+ids before any network call. Deps: `tokio-postgres` + `tokio` only.
+`cargo test`: 2 passed / 1 ignored + 1 doctest (network-free parts green
+this session; the live round-trip is `#[ignore]`, needs
+`ARUARU_DB_TEST_DSN`). For **RPoem/Poem** there is no "Poem driver" and
+none is needed: RPoem is a web framework; use a Rust async PG client —
+`aruaru-db-connector`, raw `tokio-postgres`, `sqlx` (`PgPool`), or
+RPoem's bundled `open-runo-db::aruaru::AruaruDbBackend` (plain KV only,
+no Git-on-SQL). Share `Arc<AruaruDb>` via closure capture (RPoem has no
+`Data<T>` extractor). pgwire is PostgreSQL-compatible incl. the extended
+protocol, so `tokio-postgres`/`sqlx` work as-is — no new development
+required.
+
+## HANDOFF追記(2026-09-03続き30) 公式「薄いコネクタ」を Python / Node / PHP / COBOL へ拡張
+
+続き29(Rust `aruaru-db-connector`)に続き、ユーザー指示「Rust Axum・
+Python FastAPI/Django/Flask・PHP Laravel など主要言語・FW をほとんど対応」
+「Windows/Mac/Linux/UNIX/メインフレームの COBOL も」への対応。**いずれも
+独自ドライバではなく各言語の標準 PostgreSQL クライアントの薄いラッパー**
+(`commit()` / `query_as_of()` + commit_id 検証で SQLi 防止)。
+
+### 新規(`clients/`)
+- **`python-aruaru-db/`** — PyPI `aruaru-db`。`AruaruDb`(asyncpg、
+  FastAPI 向け)+ `AruaruDbSync`(psycopg v3、Django/Flask 向け)。
+  `is_safe_commit_id`(regex `[A-Za-z0-9_-]{1,128}`)。asyncpg/psycopg は
+  optional-dependencies(未導入でも `is_safe_commit_id` は動く)。
+  **`python -m unittest` = 4 passed(ネットワーク不要ぶん、Python 3.14
+  で実行確認)**。
+- **`node-aruaru-db/`** — npm `@aruaru/db`。`pg`(node-postgres)の
+  peerDependency。`AruaruDb` / `isSafeCommitId` / `.d.ts`。
+  **`node test.js` = 4 passed**。
+- **`php-aruaru-db/`** — Composer `aruaru/db`。`PDO`(pdo_pgsql)の薄い
+  ラッパー。`AruaruDb::fromPdo(DB::connection()->getPdo())` で Laravel の
+  PDO を再利用可。**未検証**(この環境に PHP なし)。
+- **`cobol/ARUARU.cob` + README** — 埋め込み SQL(`EXEC SQL`)参照実装。
+  aruaru-db は pgwire なので COBOL からは (1) **ODBC**(psqlODBC を DSN
+  登録 + Micro Focus / OpenCOBOL ESQL、Windows/Linux/UNIX/**z/OS USS**)、
+  (2) **libpq 直呼び**(GnuCOBOL `CALL "PQexec"`)、(3) **OCESQL**
+  (`ocesql` → libpq)のいずれかで繋がる。`aruaru_commit(:msg) INTO :h` /
+  `... AS OF COMMIT :h` はホスト変数バインドだけ。**未検証**(COBOL
+  環境なし)。
+
+### `docs/CLIENTS.md` 更新
+§0.2「公式薄いコネクタパッケージ」表(Rust/Python/Node/PHP、テスト状況
+込み)、§1 マトリクスに COBOL 行、§3.8b(RPoem/Poem)は続き29 で追加済み、
+§3.8c(COBOL の 3 経路)、§4 OS 表に COBOL 行(全 OS + メインフレーム)。
+
+### 検証
+Rust `cargo test`(続き29)/ Python `unittest` 4 / Node `test.js` 4 =
+いずれもネットワーク不要ぶん green。実サーバ往復は各 README に「未検証」
+明記(この環境に稼働 server / 各言語ドライバ未導入)。PHP/COBOL は
+コンパイル・実行環境がこの開発機に無く静的作成のみ。
+
+### 次
+Go(`aruaru-db-go`)/ Java(`aruaru/db` Maven)/ .NET(`Aruaru.Db`
+NuGet)/ Ruby(`aruaru_db` gem)の同種薄ラッパー(現状は `docs/CLIENTS.md`
+§3 に生ドライバのレシピのみ)。稼働 aruaru-server を立てての各言語
+ライブ往復検証。
+
+**English**: Extended the official thin connectors (standard driver +
+`commit()` / `query_as_of()` with commit-id validation to block SQLi) to
+**Python** (PyPI `aruaru-db`: `AruaruDb` on asyncpg for FastAPI,
+`AruaruDbSync` on psycopg v3 for Django/Flask; `unittest` 4 passed),
+**Node** (npm `@aruaru/db` over `pg`; `node test.js` 4 passed), **PHP**
+(Composer `aruaru/db` over PDO; `AruaruDb::fromPdo(...)` reuses Laravel's
+PDO; not run — no PHP here), and **COBOL** (`clients/cobol/ARUARU.cob` —
+embedded `EXEC SQL`; aruaru-db is pgwire so COBOL connects via psqlODBC
+(unixODBC / Windows ODBC / **z/OS USS**), libpq `CALL`, or OCESQL;
+`aruaru_commit(:msg) INTO :h` and `AS OF COMMIT :h` are just host-var
+binds; not run — no COBOL toolchain here). `docs/CLIENTS.md` updated:
+§0.2 package table, COBOL rows in the language matrix and the per-OS
+table, §3.8c COBOL paths. Next: Go / Java / .NET / Ruby thin wrappers
+(currently only raw-driver recipes in §3), and live round-trips against
+a running server.
+
+## HANDOFF追記(2026-09-03続き31) `AS OF COMMIT` 列射影バグを修正(コネクタ実往復検証で発覚)+ 結果列 VARCHAR の明文化
+
+### 経緯
+続き29/30 で作った公式薄いコネクタ(Rust/Python/Node/PHP)の**実サーバ
+往復検証**を、ローカルに `aruaru-server`(pgwire :5433 + `ARUARU_USERS`)を
+起動して実施したところ、**2 件の実バグ/実仕様**が判明した。
+
+### バグ1: `SELECT col ... AS OF COMMIT` が列射影を無視(実害)
+2026-07-13 HANDOFF が「既知の制限」として記録していた「`select_as_of` は
+`SELECT` の列リストを無視し常にフル行を返す」が、型なしクライアント
+(`tokio-postgres` 等、`get::<String>(0)` する)では
+「`SELECT qty` を頼んだのに `id` の値(0 列目)が返る」という**実害**に
+なることを確認(`SELECT qty FROM p WHERE id='s' AS OF COMMIT '<id>'` →
+`"s"` が返っていた)。**修正**(`1566c0b`):
+- `parser.rs`: `Statement::SelectAsOf` に `columns: Option<Vec<String>>`。
+  `parse_select` が内側 `Select` の `columns` を流用。
+- `engine.rs::select_as_of`: `projection` 引数。`full_columns` から要求列を
+  順に取り出す `project` クロージャ(`SELECT *` はフル行、列指定はその順・
+  その列だけ、不明列は `Err`)。WHERE 有/無/行なしの 3 経路に適用。
+  `select_follower_read` は `None` を渡す。
+- `aruaru-wire::describe_columns`: `SelectAsOf` も `columns` を尊重
+  (RowDescription と DataRow の列数不一致による拡張プロトコルの
+  `error parsing response from server` を解消)。
+- `as_of` テストを射影後の正しい期待値へ更新 + `SELECT *` / 複数列順序 /
+  不明列 `Err` の新規アサーション。`cargo test -p aruaru-query` 60 /
+  `-p aruaru-wire` 10 / `-p aruaru-graphql` 22 = 全 green。
+
+### 仕様2: 結果列は現状すべて VARCHAR(text)
+`aruaru-wire` は関数以外の結果列を **`VARCHAR`(text フォーマット)** で
+返す(内部ストレージが文字列のため)。→ `get::<i32>` / `getInt` /
+`int(row[0])` は失敗しうる。**文字列で受けて parse する**。
+`docs/CLIENTS.md §5.1` に明記。型付き結果(実 OID)は `aruaru-wire` の
+今後の課題。
+
+### 検証状況(このセッション)
+- ユニット: 上記 92 テスト green。
+- simple プロトコル実往復: `AS OF qty=1`(正しい過去値)を確認。
+- 拡張プロトコル実往復(Rust `aruaru-db-connector` / Node `@aruaru/db` の
+  ライブテスト): **projection-fix 入り release バイナリで実施中**
+  (ビルドがこのセッション中に複数回タイムアウト・ロック競合で再実行に
+  なった。`docs/CLIENTS.md §6` / 各 `clients/*/README.md` に最新の
+  「検証済/未検証」を反映する)。
+
+### 🛑 再開用メッセージ(このトピックを次回続ける人向け)
+1. **`AS OF COMMIT` 列射影修正(`1566c0b`)は commit/push 済み。VPS 反映は
+   `/root/asrv_projfix.log` のビルド完了後に `systemctl restart
+   aruaru-server`**(このセッションで着手、完了確認まで至っていなければ
+   次回実施)。
+2. **公式薄いコネクタの実サーバ往復検証**: ローカルに
+   `target/release/aruaru-server.exe --data <tmp> --pg-port 5433
+   --gql-port 4001`(`ARUARU_USERS=app:secret`)を起動し、
+   - Rust: `ARUARU_DB_TEST_DSN="host=127.0.0.1 port=5433 user=app
+     password=secret dbname=aruaru" cargo test --manifest-path
+     clients/rust-aruaru-db/Cargo.toml -- --ignored`
+   - Node: `cd clients/node-aruaru-db && npm i pg && ARUARU_DB_DSN=...
+     node live-check.js`
+   を実行し、各 `README.md` の検証状況を更新。
+3. ~~**未着手の言語コネクタ**: Go / Java / .NET / Ruby~~ **続き32 で
+   4言語とも新設済み**(下記参照)。**残る未着手は Python `asyncpg` の
+   実サーバ往復のみ**(この環境に asyncpg 未導入のため単体テストどまり、
+   変更なし)。
+4. **`aruaru-wire` の型付き結果**(仕様2): 列 OID を実型で返す改修。
+5. GPU 側の残り(§12.4): open-directx の `dxil-spirv` vs `naga` 比較 PR、
+   open-cuda の macOS/MoltenVK 実機検証、aruaru-llm スライス(C)
+   (`ARUARU_LLM_ENABLE_*` の能力交渉自動化)。
+
+**English**: Verifying the official thin connectors (続き29/30) against a
+live local `aruaru-server` surfaced two real issues. **(1) `SELECT col
+... AS OF COMMIT` ignored column projection** — the "known limitation"
+from 2026-07-13 was a real bug for untyped clients (`SELECT qty ... AS OF
+COMMIT` returned the `id` value). Fixed in `1566c0b`: `Statement::
+SelectAsOf` now carries `columns`; `select_as_of` projects (`SELECT *` =
+full row, listed columns in order, unknown column errors);
+`aruaru-wire::describe_columns` mirrors it (fixing an extended-protocol
+"error parsing response" from a RowDescription/DataRow column-count
+mismatch). `cargo test`: aruaru-query 60 / aruaru-wire 10 / aruaru-graphql
+22 green. **(2) result columns are all `VARCHAR` (text)** for now —
+`get::<i32>` etc. fail; read as string and parse (`docs/CLIENTS.md §5.1`).
+Live round-trip: simple protocol confirmed (`AS OF qty=1`); the
+extended-protocol connector live tests are running against the rebuilt
+binary (builds timed out / hit lock contention repeatedly this session —
+update `clients/*/README.md` with the final verified/not-verified).
+**Revival**: (1) push done; deploy `1566c0b` to VPS after
+`/root/asrv_projfix.log` finishes (`systemctl restart aruaru-server`).
+(2) run the Rust (`cargo test ... -- --ignored`) and Node
+(`npm i pg && node live-check.js`) live tests against a local server on
+:5433 and update the READMEs. (3) Go / Java / .NET / Ruby connectors not
+yet built (same pattern). (4) typed results in `aruaru-wire`. (5) GPU
+§12.4 remainder.
+
+### 続き31 追記(同日、実サーバ往復 E2E 完了)
+projection-fix 入り release バイナリのビルド完了後、ローカル `aruaru-server`
+(:5433、`ARUARU_USERS=app:secret`)相手に**拡張プロトコル**のコネクタ・
+ライブ往復を実施:
+- **Rust `aruaru-db-connector`**: `cargo test -- --ignored
+  live_commit_and_as_of_round_trip` = **passed**(`connect` SCRAM/NoTls →
+  `commit()` → `query_as_of()` が過去値 `1`、最新 `5`)。
+- **Node `@aruaru/db`**: `npm i pg && node live-check.js` = **OK**
+  (同上、`as-of qty=1 / latest qty=5`)。実装中に Node 側の実バグ 1 件修正:
+  `commit()` が `SELECT aruaru_commit($1) AS commit_id` の別名に依存して
+  いたが aruaru-db は `AS alias` が効かず結果列名は関数名 `aruaru_commit`。
+  → 列名非依存(先頭列)へ修正。`node test.js` 4 件も green。
+- Python `aruaru-db` は asyncpg がこの環境に未導入のため実サーバ往復は
+  未実施(単体 4 件は green)。PHP/COBOL はツールチェーンなし。
+`clients/{rust-aruaru-db,node-aruaru-db,README}.md` の検証状況を更新済み。
+これで「🛑 再開用メッセージ」項目 2(コネクタ実往復検証)の Rust/Node 分は
+**完了**。残りは Python の asyncpg 実往復と Go/Java/.NET/Ruby の新規実装。
+
+**English**: After the projection-fix release binary built, ran the
+extended-protocol connector live round-trips against a local
+`aruaru-server` (:5433): **Rust `aruaru-db-connector`** `cargo test --
+--ignored` = passed; **Node `@aruaru/db`** `npm i pg && node
+live-check.js` = OK (both: as-of `1`, latest `5`). Fixed one real Node
+bug on the way — `commit()` relied on a `SELECT ... AS commit_id` alias
+but aruaru-db doesn't honor `AS alias` (the result column is the function
+name `aruaru_commit`); now name-independent (first column). `node
+test.js` 4 pass. Python's asyncpg isn't installed here so its live
+round-trip is not run (4 unit tests green); PHP/COBOL have no toolchain.
+Connector READMEs updated. Revival-message item 2 (connector live
+verification) is **done for Rust/Node**; remaining: Python asyncpg live
+run and Go/Java/.NET/Ruby connectors.
+
+## HANDOFF追記(2026-09-03続き32) 公式薄いコネクタを Go / Java / .NET / Ruby へ拡張(続き30/31 の「残り」を解消)
+
+続き30 の「次にすべきこと」・続き31 の「残りは Go/Java/.NET/Ruby の
+新規実装」を受け、同じパターン(**標準ドライバの薄いラッパー**、`commit()`
+は結果列を**列名ではなく位置(先頭列)**で読む——`aruaru_commit` に
+`AS alias` は効かない、`query_as_of()` は commit_id を英数字+`-`/`_`、
+≤128 文字の正規表現(`is_safe_commit_id` 系)で検証してから文字列として
+`AS OF COMMIT '<id>'` へ安全に埋め込む——バインドパラメータ非対応の
+ため)で4言語ぶん新設した。
+
+- **`clients/go-aruaru-db/`**(Go module、`jackc/pgx/v5` の薄いラッパー、
+  `pgxpool.Pool`)。`Connect`/`FromPool`/`Commit`/`QueryAsOf`/
+  `IsSafeCommitID`。ネットワーク不要ユニットテスト
+  (`TestIsSafeCommitID`)+ `ARUARU_DB_TEST_DSN` 設定時のみ走る実サーバ
+  往復テストを用意。
+- **`clients/java-aruaru-db/`**(Maven `tokyo.aon.aruaru:
+  aruaru-db-connector`、標準 JDBC ドライバの薄いラッパー)。
+  `../java-jdbc/`(依存無しの最小サンプル)を**統合**——`java-jdbc/` は
+  「Maven 無しでも動く最小コピペ例」として残置し、テスト付きの保守対象は
+  `java-aruaru-db/` に一本化。`AruaruDb.connect`/`fromConnection`/
+  `commit`/`queryAsOf`/`isSafeCommitId`。JUnit 5 テスト
+  (`isSafeCommitIdAcceptsHashesAndUuidsRejectsSql`・
+  `queryAsOfRejectsUnsafeCommitIdBeforeTouchingTheNetwork`)。
+- **`clients/dotnet-aruaru-db/`**(NuGet `Aruaru.Db`、Npgsql の薄い
+  ラッパー、同期・非同期両方の API を1クラスで提供)。`ConnectAsync`/
+  `Connect`/`FromConnection`/`CommitAsync`/`Commit`/`QueryAsOfAsync`/
+  `QueryAsOf`/`IsSafeCommitId`。xUnit テストプロジェクト
+  (`AruaruDb.Tests/`)を新設。
+- **`clients/ruby-aruaru-db/`**(gem `aruaru-db`、`Aruaru::Db::Client`、
+  標準 `pg` gem の薄いラッパー)。`Client.connect`/`.from_pg`(Rails の
+  `ActiveRecord::Base.connection.raw_connection` を再利用可)/
+  `#commit`/`#query_as_of`/`Aruaru::Db.safe_commit_id?`。RSpec
+  (`spec/aruaru_db_spec.rb`)で `safe_commit_id?`・`InvalidCommitId`・
+  `NoCommitId`・列位置読み取りをモック(`double`)ベースで検証、
+  `ARUARU_DB_TEST_DSN` 設定時のみ走る実サーバ往復 example も用意。
+
+**実際にビルド・テストを実行した結果(誇張しない)**:
+- **.NET のみ、この開発環境の `dotnet`(10.0.301)で実際にビルド・
+  テストを実行し green を確認済み**: `dotnet build
+  clients/dotnet-aruaru-db/AruaruDb.csproj` → 成功・0 警告・0 エラー、
+  `dotnet test clients/dotnet-aruaru-db/AruaruDb.Tests/` → 全 green
+  (ネットワーク不要ぶん)。ライブラリ本体は `net8.0` をターゲットに
+  しているが、この環境には .NET 10 ランタイムしか無いため、テスト
+  プロジェクトだけ `net10.0` へ向けて実行した(`net8.0` ランタイムが
+  ある環境ではテストプロジェクトも `net8.0` のままでよい)。
+- **Go / Maven(Java)/ Ruby はこの開発環境にツールチェーン
+  (`go`/`mvn`/`ruby`/`gem` コマンド)が一切存在しないため、
+  `go build`/`go test`・`mvn test`・`gem build`/`rspec` のいずれも
+  実行できていない**(`which go`/`which mvn`/`which ruby` すべて未検出を
+  確認済み)。各 `README.md` に「未検証」であることと、検証手順
+  (`go test ./...`・`mvn test`・`bundle exec rspec` 等)を明記した。
+  設計・API 形状は 2026-09-03 に実サーバ往復まで検証済みの
+  `rust-aruaru-db`/`node-aruaru-db` と同一パターンを踏襲している。
+- 実サーバ(`aruaru-server`)への実際の往復も、Go/Java/.NET/Ruby の
+  いずれも今回は未実施(.NET はビルド・テストは実施したが、この
+  パスでは稼働中サーバを別途起動しての E2E までは行っていない)。
+
+`clients/README.md`・`docs/CLIENTS.md`(§0.2 公式薄いコネクタ表・
+§1 言語×フレームワーク早見表のサンプル列)を日英で更新済み
+(`clients/java-jdbc/`→`clients/java-aruaru-db/`、`clients/go-pgx/`→
+`clients/go-aruaru-db/`、`clients/node-pg/`→`clients/node-aruaru-db/`、
+`clients/dotnet-npgsql/`→`clients/dotnet-aruaru-db/` という古いプレース
+ホルダー参照も実在するディレクトリへ差し替えた)。
+
+**次にすべきこと**: (1) Go/Java(Maven)/Ruby のビルド・テストを、
+それぞれのツールチェーンが使える環境で実行して確認、(2) 稼働中の
+`aruaru-server` を立てての Go/Java/.NET/Ruby 全連結の実サーバ往復
+(`ARUARU_DB_TEST_DSN`/`ARUARU_DB_URL` 等、各 README 記載の手順)、
+(3) `java-jdbc/` の依存無しサンプルが `java-aruaru-db/` と内容面で
+ズレないよう、今後の変更は両方に反映するか `java-jdbc/README.md` から
+`java-aruaru-db/` への誘導を強化するか検討。
+
+**English**: Extended the official thin connectors (standard driver +
+`commit()` reading the result column by **position** not name — aruaru-db
+does not honor `AS alias` on `aruaru_commit` — and `query_as_of()`
+validating commit_id against a `[A-Za-z0-9_-]{1,128}` pattern before
+string-interpolating it into `AS OF COMMIT '<id>'`, since that clause has
+no bind-parameter support) to **Go** (`clients/go-aruaru-db/`, module
+over `jackc/pgx/v5`), **Java** (`clients/java-aruaru-db/`, Maven
+`tokyo.aon.aruaru:aruaru-db-connector` over the standard JDBC driver,
+consolidating the dependency-free example that previously lived only in
+`../java-jdbc/`), **.NET** (`clients/dotnet-aruaru-db/`, NuGet
+`Aruaru.Db` over Npgsql, one class exposing both sync and async APIs),
+and **Ruby** (`clients/ruby-aruaru-db/`, gem `aruaru-db`,
+`Aruaru::Db::Client` over the standard `pg` gem, with an
+`ActiveRecord::Base.connection.raw_connection`-reuse path for Rails).
+**Only .NET was actually built and tested in this environment** —
+`dotnet build`/`dotnet test` (dotnet 10.0.301) succeeded with 0
+warnings/errors and all network-free unit tests green (library targets
+`net8.0`, test project targets `net10.0` since only the .NET 10 runtime
+is installed here). **Go/Maven/Ruby toolchains are absent from this
+environment** (`go`/`mvn`/`ruby`/`gem` all confirmed not found) so none
+of `go build`/`go test`, `mvn test`, or `gem build`/`rspec` could be run
+— each README honestly states this and gives the commands to run
+elsewhere. No live-server round-trip was performed for any of the four in
+this pass (not even for .NET, whose build/test verification stopped
+short of spinning up a real `aruaru-server`). Updated `clients/README.md`
+and `docs/CLIENTS.md` (§0.2 package table, §1 language×framework sample
+column — replacing stale placeholder paths like `clients/java-jdbc/`,
+`clients/go-pgx/`, `clients/node-pg/`, `clients/dotnet-npgsql/` with the
+real new directories) in both Japanese and English. Remaining: run the
+Go/Maven/Ruby builds and tests wherever those toolchains exist, and a
+full live-server round-trip against all four.
+
+## HANDOFF追記(2026-09-03続き32) 残る4言語の公式薄いコネクタを新設(Go/Java/.NET/Ruby)+ `java-jdbc/` を `java-aruaru-db/` へ統合
+
+続き31 の「🛑 再開用メッセージ」項目3「未着手の言語コネクタ: Go / Java /
+.NET / Ruby」を解消。既存の Rust/Python/Node/PHP コネクタと同じ設計
+(**標準ドライバの薄いラッパー**、独自ドライバではない。`commit()` は
+`aruaru_commit` の結果列を**位置**で読む〈`AS alias` 非対応〉、
+`query_as_of()`/`queryAsOf()` は commit_id を「英数字+`-`/`_`、≤128 文字」
+で検証してから `AS OF COMMIT '<id>'` を安全に文字列連結)を4言語へ展開。
+
+### 新設した4つ
+- **`clients/go-aruaru-db/`**(Go module、`github.com/jackc/pgx/v5`):
+  `aruaru.go`(`DB.Connect`/`.Commit`/`.QueryAsOf`)+ `aruaru_test.go`
+  (`IsSafeCommitID` 系2件 + `ARUARU_DB_TEST_DSN` 時のみ走るライブ往復)+
+  README。`pgx/v5` を選定した理由(拡張プロトコルをフルに使える、
+  `database/sql` 経由より高機能)を README に明記。`lib/pq` は
+  メンテナンスモードのため不採用(フォールバックとしても未使用)。
+- **`clients/java-aruaru-db/`**(Maven、`org.postgresql:postgresql`):
+  `pom.xml` + `AruaruDb.java`(`connect`/`fromConnection`/`commit`/
+  `queryAsOf`)+ `AruaruDbTest.java`(JUnit 5、`isSafeCommitId` 系2件 +
+  `ARUARU_DB_TEST_URL` 時のみ走るライブ往復)+ README。**`clients/
+  java-jdbc/`(依存無しの `Example.java` 単体、Maven プロジェクトでは
+  なかった)はこちらへ統合し `git rm` で削除**——`Example.java` の
+  ロジックは `AruaruDbTest.liveCommitAndAsOfRoundTrip` へ移植済み。
+- **`clients/dotnet-aruaru-db/`**(NuGet、`Npgsql`):`src/Aruaru.Db.csproj`
+  + `AruaruDb.cs`(`Connect`/`FromDataSource`/`CommitAsync`/
+  `QueryAsOfAsync`、`IAsyncDisposable`)+ `tests/`(xUnit、
+  `Aruaru.Db.Tests.csproj`)。**唯一この開発機に導入済みだった dotnet SDK
+  で実際にビルド・テスト実行した**(下記)。
+- **`clients/ruby-aruaru-db/`**(gem、`pg`):`aruaru-db.gemspec` +
+  `lib/aruaru/db.rb`(`Client.connect`/`.from_pg`/`#commit`/
+  `#query_as_of`)+ `lib/aruaru/db/version.rb` + `spec/`(RSpec、
+  `double` によるモックで `commit` の位置読み取り・`NoCommitId`・
+  `InvalidCommitId` を検証 + `ARUARU_DB_TEST_DSN` 時のみ走るライブ往復)。
+
+### 実際にビルド/テストした結果(正直な内訳、Windows 環境で確認)
+- **`go version`/`mvn -version`/`ruby -v`/`gem -v` はいずれもコマンド
+  未検出**(Bash/PowerShell 両方で確認)——Go・Maven・Ruby ツールチェーンは
+  この開発機に**導入されていない**。よって `go-aruaru-db`・
+  `java-aruaru-db`・`ruby-aruaru-db` の3つは**未検証**(コンパイル・
+  テスト実行いずれも不可能だった)。各 README にその旨を明記(「未検証」
+  セクション、なぜ検証できないかを具体的に記載)。
+- **`.NET` のみ `dotnet.exe`(SDK 10.0.301)が導入済みで実際にビルド・
+  テストできた**:
+  - `dotnet build src/Aruaru.Db.csproj` → **ビルド成功、0 警告・0 エラー**。
+  - `dotnet test tests/Aruaru.Db.Tests.csproj` → 当初 `net8.0` ランタイム
+    未導入(`10.0.9` のみ)で `testhost.exe` が起動失敗、
+    `tests/Aruaru.Db.Tests.csproj` に `<RollForward>LatestMajor</
+    RollForward>` を追加して解消 → **`10/10 green`(0 失敗、125ms)**。
+  - 実サーバ往復(`ARUARU_DB_TEST_CONNSTRING`)は未設定のためスキップ
+    (テストコード内で `string.IsNullOrEmpty` チェックして早期 return、
+    xUnit の `[Fact]` として素通りする実装——他言語の `#[ignore]`/
+    `assumeTrue`/`if ENV[...]` と役割は同じだが xUnit には条件付き
+    スキップの標準機構が薄いため空 return 方式にした点を正直に記録)。
+
+### `docs/CLIENTS.md` / `clients/README.md` 更新
+§0.2 の「公式薄いコネクタパッケージ」表に4行追加(Go/Java/.NET/Ruby、
+ディレクトリ・下敷きドライバ・検証状況込み)。`clients/README.md` の
+ディレクトリ一覧表にも同様に4行追加、`java-jdbc/` 行を `java-aruaru-db/`
+統合の記述へ差し替え。Rust/Node/Python/PHP/COBOL の既存コネクタの
+ソース・テストファイル自体は今回一切変更していない(ドキュメント2ファイル
+からの参照のみ追加)。
+
+### 正直な開示・次にやること
+1. **Go/Java/Ruby の3コネクタは実ビルド・実テストとも未検証**——この
+   開発機にツールチェーンが無いため。設計は `dotnet-aruaru-db`(実ビルド
+   済み)および実サーバ往復まで確認済みの `rust-aruaru-db`/
+   `node-aruaru-db` と同一パターンを踏襲しているが、それ自体は
+   コンパイルが通ることの保証にはならない——ツールチェーンが使える
+   環境で `go build`/`go test`・`mvn compile`/`mvn test`・
+   `bundle exec rspec`/`gem build` を実行して確認すること。
+2. **4コネクタとも実サーバ往復(ライブ E2E)は未実施**——.NET も含め、
+   このパスでは `aruaru-server` を実際に起動していない(続き31 で
+   Rust/Node は実施済み)。
+3. 続き31 から変更なし: Python `asyncpg` の実サーバ往復、
+   `aruaru-wire` の型付き結果、GPU §12.4 残り。
+
+**English**: Closed revival-message item 3 from 続き31 ("Go / Java / .NET
+/ Ruby connectors not yet built") by adding four new official thin
+connectors, all following the same pattern as the existing Rust/Python/
+Node/PHP ones (wrap the language's **standard** PostgreSQL driver;
+`commit()` reads the `aruaru_commit` result column by **position**, not
+name; `query_as_of`/`queryAsOf` validates the commit id against
+`[A-Za-z0-9_-]{1,128}` before string-interpolating `AS OF COMMIT '<id>'`).
+**`clients/go-aruaru-db/`** (Go module, `jackc/pgx/v5` — chosen over
+`lib/pq`, which is in maintenance mode, for full extended-protocol
+support). **`clients/java-aruaru-db/`** (Maven, `org.postgresql:
+postgresql`) — **consolidates and removes** the old `clients/java-jdbc/`
+(a dependency-free `Example.java` with no Maven project; its logic is now
+`AruaruDbTest.liveCommitAndAsOfRoundTrip`). **`clients/dotnet-aruaru-db/`**
+(NuGet, Npgsql) — the **only one actually built and tested** here, since
+this machine has only the .NET SDK installed (no Go/Maven/Ruby
+toolchain, verified via both Bash and PowerShell `command -v`/
+`Get-Command`): `dotnet build` succeeded with 0 warnings/errors;
+`dotnet test` initially failed to launch (`net8.0` runtime missing, only
+`10.0.9` present) until `<RollForward>LatestMajor</RollForward>` was
+added to the test csproj, after which **10/10 tests passed**. Live-server
+round-trips are not run for any of the four (no `ARUARU_DB_TEST_*` env
+var set in this session). **`clients/ruby-aruaru-db/`** (gem, `pg`).
+Updated `docs/CLIENTS.md` §0.2 and `clients/README.md` with all four
+(honestly marked "not verified" for Go/Java/Ruby, "built+tested,
+live-untested" for .NET); did not touch the existing Rust/Node/Python/
+PHP/COBOL connector source or test files. Honest gaps carried forward:
+Go/Java/Ruby need a real toolchain to verify compilation at all; none of
+the four four has a live-server round-trip yet; Python asyncpg live
+round-trip and `aruaru-wire` typed results remain open from 続き31.
+
+## HANDOFF追記(2026-09-03続き33) 公式「薄いコネクタ」を Mojo へ拡張(Python 相互運用経由、ネイティブドライバ非依存)
+
+ユーザー指示: 「Mojo(Modular)にも対応してほしい」。続き28〜32 と同じ
+「標準ドライバ + 薄いラッパー」哲学の踏襲。
+
+### 設計判断
+Mojo は 2026 年時点でも成熟したネイティブ PostgreSQL ドライバを持たない
+(若いシステムプログラミング言語、DB ドライバのエコシステムは Python ほど
+育っていない)。一方 Mojo は `from python import Python` による強力な
+Python 相互運用(CPython 埋め込み)を持つ。よって**独自ワイヤプロトコルは
+実装せず**、既存の公式 Python コネクタ `clients/python-aruaru-db/`
+(それ自体 `asyncpg`/`psycopg` の薄いラッパー)を Python 相互運用経由で
+そのまま呼び出す、という設計にした——存在しないネイティブ Mojo PostgreSQL
+ドライバを捏造しない、が今回の最重要判断。
+
+### 新設(`clients/mojo-aruaru-db/`)
+- **`aruaru_db.mojo`**: `is_safe_commit_id`(英数字+`-`/`_`、1〜128 文字)
+  を **Mojo ネイティブ**に実装(Python 相互運用を経由しない——他の全
+  コネクタと同じ「ネットワークに触れる前にローカル検証」設計)。
+  `AruaruDb` struct(`Python.import_module("aruaru_db").AruaruDbSync` を
+  内部に保持する薄いラッパー)に `connect`/`execute`/`commit`/
+  `query_as_of`/`query_as_of_val`/`raw()`。既定は同期(`AruaruDbSync`、
+  `psycopg` v3)——Mojo 自身の async/await ランタイムが発展途上のため、
+  Python `asyncio` イベントループとの相互運用よりも同期経路を既定に
+  する方が誠実と判断(非同期が要る場合は `raw()` 経由で `aruaru_db.
+  AruaruDb`〈asyncpg 版〉を直接使える)。
+- **`test_aruaru_db.mojo`**: ネットワーク不要のユニットテスト
+  (`is_safe_commit_id` の受理/拒否/過長ID拒否3件 + `query_as_of` の
+  ネットワーク到達前拒否1件)+ `ARUARU_DB_TEST_DSN` 設定時のみ走る実
+  サーバ往復テスト(Go の `os.Getenv` skip・.NET の早期 return と同じ
+  パターン)。
+- **`README.md`**: 設計判断の説明、セットアップ(Mojo が埋め込む Python
+  環境に `python-aruaru-db` + `psycopg[binary]` を pip install)、使用例、
+  **検証状況セクション**(下記)。
+
+### 検証状況(正直な開示)
+`which mojo` / `mojo --version` / `which magic` / `which modular` を
+すべて実行し、**この開発環境に Mojo コンパイラ/インタプリタも
+`magic`/`modular` CLI も一切導入されていない**ことを確認した(Go/Maven/
+Ruby ツールチェーン不在〈続き32〉と同じ状況)。したがって
+`aruaru_db.mojo`/`test_aruaru_db.mojo` は**この環境で一度もコンパイル・
+実行されていない**——Mojo の言語知識に基づき可能な限り正確に書いたが、
+構文エラー・API の記憶違いの可能性を否定しない。実サーバ往復は
+なおさら未実施。README.md に `clients/go-aruaru-db/`・
+`clients/java-aruaru-db/`・`clients/ruby-aruaru-db/` と同じ誠実さの
+基準で「未検証」と明記し、次にやるべき検証手順(`mojo build`→依存導入→
+`mojo run test_aruaru_db.mojo`→実サーバ往復)を記載した。
+
+### ドキュメント更新
+`docs/CLIENTS.md` §0.2(公式薄いコネクタ表に Mojo 行追加)・§1(言語×
+フレームワーク行列、日英両方に Mojo 行追加)、`clients/README.md`
+(ディレクトリ一覧表に Mojo 行追加)。既存の Rust/Python/Node/PHP/Go/
+Java/.NET/Ruby/COBOL コネクタのソース・テストファイル・ドキュメントは
+今回一切変更していない。
+
+### 次にすべきこと
+(1) `mojo`/`magic` が使える環境でのコンパイル確認、(2) Python 側依存
+(`aruaru_db`、`psycopg[binary]`)導入後のネットワーク不要テスト実行、
+(3) 実 `aruaru-server` を立てての実サーバ往復検証、(4) 続き32 から
+継続: Go/Java/Ruby の実ビルド確認・4コネクタ全ての実サーバ往復、
+Python `asyncpg` 実往復、`aruaru-wire` の型付き結果。
+
+**English**: Added `clients/mojo-aruaru-db/`, the official thin connector
+for Mojo (Modular). As of this writing Mojo has no mature native
+PostgreSQL driver ecosystem, so rather than fabricate a from-scratch
+wire-protocol implementation, this connector wraps the existing official
+Python connector (`clients/python-aruaru-db/`, itself a thin wrapper over
+standard `asyncpg`/`psycopg`) via Mojo's Python interop layer (`from
+python import Python`) — the same "standard driver, thin wrapper"
+philosophy as every other connector in this repo, just with one extra
+Python hop instead of a native PostgreSQL driver hop. `aruaru_db.mojo`
+implements `is_safe_commit_id` **natively in Mojo** (no Python round-trip
+needed, matching the "validate before touching the network" pattern used
+by every other connector) and an `AruaruDb` struct wrapping
+`aruaru_db.AruaruDbSync` (sync/`psycopg` by default — Mojo's own
+async/await story is still evolving, so bridging it with Python's asyncio
+loop was judged not worth the reliability trade-off; async is reachable
+via `raw()`). `test_aruaru_db.mojo` covers the network-free validation
+paths plus an `ARUARU_DB_TEST_DSN`-gated live round-trip. **Toolchain
+reality check**: confirmed via `which`/`--version` that this environment
+has no `mojo` compiler/interpreter and no `magic`/`modular` CLI (same
+situation as the missing Go/Maven/Ruby toolchains in 続き32) — so neither
+`.mojo` file has been compiled or run here; the README states this
+honestly, matching the standard already set by
+`clients/go-aruaru-db/README.md`, `clients/java-aruaru-db/README.md`, and
+`clients/ruby-aruaru-db/README.md`. Updated `docs/CLIENTS.md` (§0.2
+connector table, §1 language matrix in both languages) and
+`clients/README.md`; did not touch any other connector's files.
+
+## HANDOFF追記(2026-09-05) Go/Java/Ruby ツールチェーンを実際にネットから導入 + Mojoの「未検証」判断を訂正(WSL経由で実導入・実機検証)
+
+**経緯**: 続き32/33 が「この開発機にGo/Maven/Ruby/Mojoのツールチェーンが
+無いため未検証」としていたことに対し、ユーザーから「ネットから入手
+できないのですか?」との指摘。実際に試したところ、いずれもネットワーク
+経由で導入可能だった——**「ツールチェーンが無い」という前提そのものを
+再検証すべきだった**という反省点を明記する。
+
+### 実際に導入したもの
+- **Go 1.23.4**(公式`go.dev`から直接zip取得、`C:\devtools\go`へ展開)。
+  `go version`で動作確認済み。
+- **Apache Maven 3.9.16**(`dlcdn.apache.org`から直接zip取得、Java 17は
+  この開発機に既導入済みだったためJDK別途インストール不要)。
+  `mvn -v`で動作確認済み。
+- **Ruby 3.3.6**(RubyInstaller公式exe、`/VERYSILENT`でサイレント
+  インストール)。`ruby -v`/`gem -v`で動作確認済み。
+- **WSL2 Ubuntu**(既にこの開発機に導入済みと判明)+ **pixi**
+  (Modular公式、`curl -fsSL https://pixi.sh/install.sh | sh`)経由で
+  **Mojo 1.0.0コンパイラ**を実際に導入・`mojo run`での実行に成功
+  (詳細は`clients/mojo-aruaru-db/README.md`の2026-09-05追記参照——
+  Python相互運用モジュール自体がこの配布チャンネルに同梱されていない
+  という、より具体的な別の制約が判明した)。
+
+### 実際にビルド・テストまで完了(Go/Java/Ruby)
+- **Go**: `go mod tidy`(`jackc/pgx/v5`等の依存を実際に取得、`go.sum`
+  生成・コミット)→`go build ./...`成功→`go test ./... -v`で
+  `TestIsSafeCommitID`・`TestQueryAsOfRejectsUnsafeCommitIDBeforeTouching
+  TheNetwork`が実際にPASS、`TestLiveCommitAndAsOfRoundTrip`は
+  `ARUARU_DB_TEST_DSN`未設定のため正しくSKIP。
+- **Java**: `mvn test`で`BUILD SUCCESS`、`Tests run: 3, Failures: 0,
+  Errors: 0, Skipped: 1`(スキップは実サーバ往復テスト、同上の理由)。
+- **Ruby**: `gem install rspec`(純Rubyのため`pg`のネイティブ拡張
+  ビルド不要と判明)→`rspec`で`5 examples, 0 failures`。
+  `lib/aruaru/db.rb`が`require "pg"`を`.connect`メソッド内でのみ
+  遅延実行する設計のため、`pg` gem自体を導入しなくても`double`
+  ベースの単体テストは実行できることを実機で確認した。
+
+**Mojo**: 上述の通りコンパイラ自体の導入・実行(`mojo run`)には成功
+したが、`aruaru_db.mojo`が依存する`from python import Python`が
+`error: unable to locate module 'python'`で解決できないことを実機
+確認済み(このMojo 1.0.0配布チャンネルにPython相互運用モジュールが
+含まれていない)。Mojo 1.0の言語仕様変更(`fn`→`def`、`let`→`var`、
+`len(s)`/`s[i]`→`s.byte_length()`/`s[byte=i]`)に合わせて
+`aruaru_db.mojo`/`test_aruaru_db.mojo`の構文は修正済みで、Python
+相互運用を使わない部分(`is_safe_commit_id`)は実際にコンパイル・
+実行し正しい結果を得ることを確認した(詳細は
+`clients/mojo-aruaru-db/README.md`参照)。
+
+**教訓(今後のセッション共通の指針として記録)**: 「この開発機に
+コマンドが無い」という事実確認は、「ネットから入手できない」ことの
+証明にはならない。特にGo/Java/Ruby/Node/Pythonのような主要言語の
+公式配布物は大抵ZIP/公式インストーラで即座に取得できるため、
+「ツールチェーン不在→未検証のまま次へ」と結論する前に、まず
+ダウンロード・インストールを試みること。
+
+- 次にすべきこと: (1) 実サーバ往復(`ARUARU_DB_TEST_*`環境変数、
+  実`aruaru-server`起動)をGo/Java/Ruby全てで実施、(2) Python相互運用
+  モジュールを含む別のMojoディストリビューション/バージョンの調査、
+  (3) Python(`asyncpg`)の実サーバ往復も依然未実施のまま(続き31参照)。
+
+## HANDOFF追記(2026-09-06) Go/Java/Ruby/Rust/Mojo 全て実サーバ往復まで完了 + Mojo旧バージョンでPython相互運用が実機動作確認 + `rust-axum`サンプルの実バグ3件を発見・修正 + aruaru-wireの深刻なグローバルトランザクションバグを発見
+
+前回HANDOFF(2026-09-05)の「次にすべきこと」を全て実施。加えて未着手だった
+`rust-axum`(Poem/RPoemが同じパターンで使うAxum+sqlxサンプル)を実際に
+ビルド可能なプロジェクトへ組み立てて実行したところ、サンプル自体のバグ
+3件と、`aruaru-wire`本体の深刻なバグ1件を発見した。
+
+### 1. Go/Java/Ruby/Rust の実サーバ往復(ARUARU_DB_TEST_*)を全て実施・成功
+ローカルに実`aruaru-server`(`--pg-port 5433/5434`、`ARUARU_USERS=app:
+secret`)を起動し:
+- **Go**: `ARUARU_DB_TEST_DSN=postgres://app:secret@127.0.0.1:5433/app
+  go test -run Live -v ./...` → `TestLiveCommitAndAsOfRoundTrip ... PASS`。
+- **Java**: `ARUARU_DB_TEST_URL=jdbc:postgresql://127.0.0.1:5433/app
+  mvn test` → `Tests run: 3, Failures: 0, Errors: 0, Skipped: 0`
+  (`BUILD SUCCESS`)。
+- **Ruby**: `gem install pg`(Windows用プリコンパイル済みバイナリ
+  `pg-1.6.3-x64-mingw-ucrt`が取得され、Cコンパイラ環境無しで導入できた
+  ——当初の懸念は誤りだった)+ `ARUARU_DB_TEST_DSN=... rspec` →
+  `6 examples, 0 failures`。
+- **Rust(`rust-aruaru-db`)**: 2026-09-03時点で既に検証済みだったが、
+  今回は**WSL2 Ubuntu上でネイティブLinuxビルド**(`rustup`経由でRust
+  1.98.1をWSLへ導入)としても再実行し、`cargo test --release --
+  --ignored` → `test tests::live_commit_and_as_of_round_trip ... ok`
+  (Windows/Linux両方で往復成功を確認)。
+
+各READMEに実行結果を反映済み。
+
+### 2. Mojoコネクタ: 旧バージョン(0.26.2.0)でPython相互運用が実機動作
+前回HANDOFF(2026-09-05)で「Mojo 1.0.0にはPython相互運用モジュールが
+無い」と判明していたが、`pixi search -c https://conda.modular.com/max
+mojo`でこのチャンネルに旧リリース(`0.26.2.0`等)も配布されていることを
+発見。`pixi add "mojo==0.26.2.0"`で実際に導入したところ、
+**`from python import Python`が実際にコンパイル・実行に成功**
+(`Implicit standard library imports are deprecated`という将来向け
+非推奨警告のみ)。続けてPython側の依存(`aruaru_db`、
+`psycopg[binary]`)を導入し、`aruaru_db.mojo`/`test_aruaru_db.mojo`
+本体を**実際にコンパイル・実行**:
+- ネットワーク不要テスト4件: `mojo run test_aruaru_db.mojo` →
+  `test_aruaru_db.mojo: all checks passed`(`ARUARU_DB_TEST_DSN`未設定
+  時は`skipped`メッセージ付き)。
+- **実サーバ往復**: `ARUARU_DB_TEST_DSN="host=<WSLからWindowsホストへの
+  デフォルトゲートウェイIP> port=... user=app password=secret
+  dbname=aruaru" mojo run test_aruaru_db.mojo` → `skipped`メッセージが
+  出なくなり、`test_live_commit_and_as_of_round_trip`本体
+  (`AruaruDb.connect`→`commit`→`AS OF COMMIT`往復)が実際に実行され
+  成功したことを確認(`all checks passed`)。
+
+**結論**: Mojo 1.0.0系での動作は引き続き未確認だが、旧バージョン
+(0.26.2.0)を`pixi add "mojo==0.26.2.0"`で指定すれば、このコネクタは
+設計通りに完全動作することを実機で確認できた。
+
+### 3. `clients/rust-axum/main.rs`の実バグ3件を発見・修正
+このファイルは2026-09-03の新設時点で「Cargo.tomlを伴わないレシピ」に
+留まり、**一度も実際にビルド・実行されたことがなかった**。今回、実際に
+`Cargo.toml`を組み立てビルド可能なプロジェクトとしてWSL2 Linux上で
+実行したところ、以下3件の実バグが判明した(いずれも修正済み):
+1. `pool.begin()`(sqlxの明示トランザクション)が`BeginFailed`で失敗し、
+   後続で「transaction already active」というプール接続状態異常を
+   誘発した——他の全コネクタと同じ「明示的トランザクションでラップ
+   しない」パターンへ揃えて撤去。
+2. `get_latest`/`get_as_of`が`Option<i32>`で列をデコードしようとして
+   `ColumnDecode`エラーで失敗(コメント自体は「Stringで受けてparseする」
+   と正しく書かれていたが実装コードが追従しておらず、コメントと
+   コードが乖離していた——このエコシステムで繰り返し見つかる
+   ドキュメント/実装の乖離パターンの新たな実例)。`Option<String>`で
+   受けてから`i32`へparseする形に修正。
+3. `get_as_of`が`AS OF COMMIT $2`をバインドパラメータとして渡そうと
+   していたが、aruaru-wireは`AS OF COMMIT`句をバインドパラメータとして
+   受け付けない(他の全コネクタが共通して行う「commit_idを検証してから
+   文字列連結する」設計から外れていた)。`is_safe_commit_id`
+   (英数字+`-`/`_`、≤128文字)で検証してから安全に文字列連結する形へ
+   修正。
+修正後、実際に`upsert→commit→最新値取得→再upsert`が正しいJSONを返す
+ことを実機で確認した(`AS OF COMMIT`往復自体は下記4番のバグにより
+このセッションでは最終確認できず、次回の課題として残る)。
+
+### 4. `aruaru-wire`の深刻な実バグを発見(修正は専用タスクへ切り出し)
+上記3の検証中、**全く別の新規接続からの単純なautocommit INSERT**でも
+「transaction already active」エラーが再現することに気づき調査した
+結果、`crates/aruaru-query/src/engine.rs`の`QueryEngine`が
+`txn: parking_lot::Mutex<Option<TxnState>>`という**単一の共有インスタンス
+上のグローバル状態**でトランザクションを管理していることが根本原因と
+判明した(`aruaru-wire`は`Arc<QueryEngine>`を全pgwire接続で共有する
+設計、`crates/aruaru-wire/src/lib.rs`76行目付近)。
+
+**影響**: どれか1つのクライアントが`BEGIN`を送った後、`COMMIT`/
+`ROLLBACK`せずに(クライアント側のエラー・クラッシュ・プロトコル
+不整合等の理由で)処理が中断すると、`txn`はSomeのまま残り続け、
+**以後サーバー全体で全く別の接続からの全ての`BEGIN`(および暗黙の
+autocommit書き込みの一部)が「transaction already active」で永久に
+失敗するようになる**。サーバー再起動以外に回復手段がない(同じ
+プロセスが生き続ける限り、他の接続がCOMMIT/ROLLBACKを送っても、
+それは別セッションが張ったつもりの見えないトランザクションの後始末に
+しかならず、根本的には解消しない)。
+
+**再現手順(実機で確認済み)**: sqlxの`pool.begin()`がサーバー側では
+成功したがクライアント側で何らかの理由により`BeginFailed`として
+処理された状態を作った後、全く別の新規接続(Python psycopg3)から
+プレーンな`INSERT`を実行したところ`psycopg.errors.SyntaxError:
+transaction already active`で失敗することを確認。
+
+**対応**: `parking_lot::Mutex<Option<TxnState>>`という単一グローバル
+状態を、pgwire接続(セッション)ごとに分離した状態へ設計変更する必要が
+あり、`aruaru-wire`/`aruaru-query`/`aruaru-graphql`/`aruaru-server`
+複数クレートにまたがる影響範囲の調査を要する規模のため、専用の
+フォローアップタスクとして切り出した(`spawn_task`で
+`task_d3c43773`として記録、詳細な修正方針・再現手順はタスクの
+プロンプト本文を参照)。**このバグ自体は`rust-axum`サンプルの実装
+ミスとは独立に、どんなクライアントであっても一度BEGINしてCOMMIT/
+ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**——今回は
+コネクタのテスト作業中に偶然踏み抜いた形だが、実運用でも同様の
+条件(クライアントの異常切断等)で発生しうるため優先度は高いと判断する。
+
+### 5. Rustのメインフレーム対応・「AWSのメインフレーム」の技術的整理
+ユーザーからの一連の質問への回答をここに記録する。
+- **z/OS実機(z/Architecture)へのRust対応**: rustc/LLVMには公式の
+  z/OSターゲットが存在せず、非公式コミュニティ実装も未成熟——これは
+  「開発すれば動く」種類の制約ではなく、コンパイラ自体の技術的制約
+  である。COBOL/Java/Cのようなメインフレーム到達経路(ODBC/EXEC SQL/
+  JZOS等)がRustには無い。
+- **「AWSのメインフレーム」の実体**: これは実際のIBM Z実機
+  (z/Architecture)ではなく、**AWS Mainframe Modernization**
+  (COBOL/PL1資産を標準的なAWS Linux基盤〈x86_64 EC2〉へリホスト/
+  リファクタリングするサービス)である。つまり実体は**普通のLinux**
+  であり、Rust/Poem/RPoemは追加のポーティング作業なしに、既存の
+  Linux向けビルドがそのまま動作する。「z/OS実機」と「AWSメインフレーム」
+  は技術的に全く別物である点を明確にした。
+- 上記を実証する形で、`rust-aruaru-db`をWSL2 Ubuntu(x86_64-unknown-
+  linux-gnu、AWS Mainframe Modernizationが実際にワークロードを再ホスト
+  する先と同種の環境)上でネイティブビルド・実サーバ往復まで成功させた
+  (上記1番参照)。
+
+- 次にすべきこと: (1) `task_d3c43773`(aruaru-wireのグローバル
+  トランザクションバグ修正)、(2) `rust-axum`の`AS OF COMMIT`往復の
+  最終確認(上記4番のバグにより今回未完了)、(3) Python(`asyncpg`)の
+  実サーバ往復、(4) PHP(`php-cli`/`php-pgsql`はWSLへ導入済み、
+  `php-aruaru-db`にはテストファイル自体が存在しないため新規作成が
+  必要)・COBOL(`gnucobol4`はWSLへ`sudo -u root`経由で導入済み、
+  `clients/cobol/ARUARU.cob`の実コンパイル・実行は未実施)の実検証。
+
+## API 方針: REST 全廃・gRPC / Connect へ (2026-11-04)
+
+### 日本語
+- **REST は全廃する。新しい API は REST で作らない。** ブラウザや `curl` から呼ぶ API は **Connect の単純呼び出し**(`POST /<パッケージ>.<Service>/<Method>`、`content-type: application/json`、本文は JSON)、サービス間は **gRPC / gRPC-web**(RPoem の管理API `open_runo.admin.v1.Admin` と同じ流儀)。ストリーミングは、必要になってから。
+- **既存の REST は、触るときに順に移す。** 移したら旧 REST の経路は消す。移行が終わるまで残るが、**新規には追加しない**。
+- **JSON は RS-JSON に統一**する(読み込みは `from_str_secure` / `parse_secure` でサイズ・深さ・重複キーの上限つき、書き出しは `rust_json::fast`)。ブラウザの WASM に `prost` は入れない(サイズが増えるため)。
+- **例外(自分たちの API ではなく、相手の規格が決めているもの)**: ACME、OAuth/OIDC のコールバック、第三者(GitHub など)からの Webhook、ヘルスチェック、静的ファイル配信、OTLP など。これらは規格どおりの HTTP を受ける。
+- 参考実装: `RPoem`(`open_runo.admin.v1.Admin`)、`open-easy-web`(`server/src/connect.rs`、`proto/open_easy_web/admin/v1/admin.proto`)。
+- ※ このリポジトリのコードが既に方針どおりかどうかは、各リポジトリの現状による。この節は方針の記録であり、コードの変更を意味しない。
+
+### English
+- **REST is being abolished. New APIs are not built as REST.** APIs called from browsers or `curl` use **Connect unary calls** (`POST /<package>.<Service>/<Method>`, `content-type: application/json`, JSON body); service-to-service calls use **gRPC / gRPC-web** (the same style as RPoem's admin API `open_runo.admin.v1.Admin`). Streaming only when it is actually needed.
+- **Existing REST endpoints are migrated one by one, when they are touched.** The old REST route is removed once migrated. Until migration is finished they remain, but **no new ones are added**.
+- **JSON is unified on RS-JSON**: reading with `from_str_secure` / `parse_secure` (size, depth and duplicate-key limits), writing with `rust_json::fast`. `prost` is not put into browser WASM (it would grow the binary).
+- **Exceptions (shapes dictated by someone else's standard, not our own API)**: ACME, OAuth/OIDC callbacks, webhooks from third parties (e.g. GitHub), health checks, static file serving, OTLP, and so on. These accept plain HTTP as the standard requires.
+- Reference implementations: `RPoem` (`open_runo.admin.v1.Admin`) and `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Note: whether the code in a given repository already follows this policy depends on that repository. This section records the policy; it does not mean the code has been changed.
+
+### Deutsch (KI-Übersetzung, redaktionell überarbeitet; noch nicht von Muttersprachlern geprüft)
+- **REST wird vollständig abgeschafft; neue APIs entstehen nicht mehr als REST.** APIs, die aus dem Browser oder per `curl` aufgerufen werden, verwenden **unäre Connect-Aufrufe** (`POST /<Paket>.<Service>/<Methode>`, `content-type: application/json`, JSON-Body). Zwischen Diensten kommen **gRPC bzw. gRPC-web** zum Einsatz, im selben Stil wie die Admin-API von RPoem (`open_runo.admin.v1.Admin`). Streaming wird erst ergänzt, wenn es tatsächlich gebraucht wird.
+- **Bestehende REST-Endpunkte werden schrittweise umgestellt, und zwar immer dann, wenn man ohnehin an ihnen arbeitet.** Sobald ein Endpunkt umgestellt ist, wird die alte REST-Route entfernt. Bis zum Abschluss der Migration bleiben die übrigen bestehen, es werden aber **keine neuen mehr hinzugefügt**.
+- **JSON wird einheitlich über RS-JSON verarbeitet**: Gelesen wird mit `from_str_secure` bzw. `parse_secure` (mit Obergrenzen für Größe, Verschachtelungstiefe und doppelte Schlüssel), geschrieben mit `rust_json::fast`. `prost` wird nicht in das Browser-WASM aufgenommen, da es die Datei vergrößern würde.
+- **Ausnahmen (Schnittstellen, deren Form ein fremder Standard vorgibt und die nicht zu unserer eigenen API gehören)**: ACME, OAuth/OIDC-Callbacks, Webhooks von Drittanbietern (z. B. GitHub), Health-Checks, die Auslieferung statischer Dateien, OTLP und Ähnliches. Diese nehmen, wie vom jeweiligen Standard verlangt, gewöhnliches HTTP entgegen.
+- Referenzimplementierungen: `RPoem` (`open_runo.admin.v1.Admin`) und `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Hinweis: Ob der Code eines einzelnen Repositorys diese Richtlinie bereits erfüllt, hängt vom jeweiligen Repository ab. Dieser Abschnitt dokumentiert lediglich die Richtlinie; er besagt nicht, dass der Code schon angepasst wurde.
+
+### Русский (перевод выполнен с помощью ИИ и отредактирован; носителями языка пока не проверен)
+- **От REST мы полностью отказываемся; новые API больше не создаются в стиле REST.** API, к которым обращаются из браузера или через `curl`, используют **унарные вызовы Connect** (`POST /<пакет>.<Service>/<Method>`, `content-type: application/json`, тело запроса — JSON). Для взаимодействия между сервисами применяются **gRPC и gRPC-web** — в том же стиле, что и административный API RPoem (`open_runo.admin.v1.Admin`). Потоковая передача данных добавляется лишь тогда, когда в ней действительно возникает необходимость.
+- **Существующие REST-эндпоинты переводятся поэтапно — по мере того, как с ними приходится работать.** После перевода старый REST-маршрут удаляется. Пока миграция не завершена, оставшиеся эндпоинты сохраняются, но **новые не добавляются**.
+- **Работа с JSON унифицирована на основе RS-JSON**: чтение — через `from_str_secure` или `parse_secure` (с ограничениями на размер, глубину вложенности и повторяющиеся ключи), запись — через `rust_json::fast`. `prost` в браузерный WASM не включается, поскольку это увеличило бы размер файла.
+- **Исключения (интерфейсы, форму которых определяет чужой стандарт, а не наш собственный API)**: ACME, обратные вызовы OAuth/OIDC, вебхуки сторонних сервисов (например, GitHub), проверки работоспособности, раздача статических файлов, OTLP и тому подобное. Такие интерфейсы принимают обычный HTTP, как того требует соответствующий стандарт.
+- Эталонные реализации: `RPoem` (`open_runo.admin.v1.Admin`) и `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Примечание: соответствует ли код конкретного репозитория этой политике, зависит от самого репозитория. Данный раздел лишь фиксирует политику и не означает, что код уже изменён.
+
+## API 方針の補足: 用語の整理と使い分け (2026-11-04)
+
+### 日本語
+**1つに統一するものではなく、別の層の話です。** 「REST の代わり」になるのは Connect・gRPC・GraphQL だけで、WASM は画面を作る技術です。
+
+| 用語 | 何か | REST の代わりか |
+|---|---|---|
+| REST | URL と HTTP メソッドで操作を表す API の作り方 | 全廃する側 |
+| **Connect** | `POST /サービス名/メソッド名` に JSON を送る形式。`curl` でもブラウザの `fetch` でも呼べる | はい(**採用**) |
+| **gRPC** | 同じ「サービス/メソッド」の考え方を、バイナリ(protobuf)と HTTP/2 で行う形式。速く、ストリーミングも得意 | はい(**サービス同士に採用**) |
+| gRPC-web | gRPC のブラウザ向けの変形版 | はい(必要なら) |
+| GraphQL | 欲しい項目を問い合わせる形式 | 一部だけ(**問い合わせ(読み取り)専用**) |
+| WASM | Rust をブラウザの中で動かす仕組み | いいえ(画面を作る技術) |
+
+- **ブラウザの画面や `curl` から呼ぶ API は Connect**(POST、JSON を RS-JSON で読み書き)。ブラウザの WASM は素の gRPC を話せず、Connect なら `fetch` のままで、`prost` を足さずに済む(画面のサイズも増えない)。
+- **サービス同士の通信(サーバー間、重い処理、ストリーミング)は gRPC。** 多くは Connect で足りるので、ストリーミングが必要になった所だけ gRPC に上げる。
+- **GraphQL は、まとめて問い合わせたいときの読み取り専用。** 書き込み(操作)には使わない。
+- **WASM は画面を作る技術として、そのまま使う。** 画面から呼ぶ API が Connect になっただけ。
+- 外部の規格が形を決めるもの(ACME、OAuth のコールバック、第三者の Webhook、ヘルスチェック、静的ファイル、OTLP)は、規格どおりの HTTP のまま。
+- **迷ったら Connect。**
+
+### English
+**These are not alternatives to unify; they sit at different layers.** Only Connect, gRPC and GraphQL can replace REST; WASM is a way to build the UI.
+
+| Term | What it is | Replaces REST? |
+|---|---|---|
+| REST | API style that expresses operations through URLs and HTTP methods | The thing being abolished |
+| **Connect** | `POST /Service/Method` with a JSON body; callable from `curl` and from a browser `fetch` | Yes (**adopted**) |
+| **gRPC** | The same service/method idea over binary (protobuf) and HTTP/2; fast, good at streaming | Yes (**for service-to-service**) |
+| gRPC-web | A browser-friendly variant of gRPC | Yes (if needed) |
+| GraphQL | A query language: ask for exactly the fields you want | Partly (**read-only queries**) |
+| WASM | Runs Rust inside the browser | No (a UI technology) |
+
+- **APIs called from browser screens or `curl` use Connect** (POST, JSON read and written with RS-JSON). Browser WASM cannot speak plain gRPC; with Connect it stays a `fetch`, and `prost` is not needed (the binary does not grow).
+- **Service-to-service calls (server to server, heavy work, streaming) use gRPC.** Connect is enough in most places; move a call to gRPC only where streaming is actually needed.
+- **GraphQL is read-only**, for queries that gather several pieces of data. It is not used for writes (operations).
+- **WASM stays as the way to build the UI.** The API it calls simply became Connect.
+- Interfaces whose shape an outside standard dictates (ACME, OAuth callbacks, third-party webhooks, health checks, static files, OTLP) stay plain HTTP.
+- **When in doubt, use Connect.**
+
+### Deutsch (KI-Übersetzung, sprachlich überarbeitet; noch nicht von Muttersprachlern geprüft)
+**Es geht nicht darum, eine einzige Technik auszuwählen – die Begriffe liegen auf unterschiedlichen Ebenen.** Als Ersatz für REST kommen nur Connect, gRPC und GraphQL in Frage; WASM dagegen ist eine Technik, mit der die Benutzeroberfläche gebaut wird.
+
+| Begriff | Was ist das? | Ersatz für REST? |
+|---|---|---|
+| REST | Ein API-Stil, bei dem Operationen über URLs und HTTP-Methoden ausgedrückt werden | wird abgeschafft |
+| **Connect** | `POST /Dienst/Methode` mit JSON im Body; aufrufbar mit `curl` ebenso wie mit `fetch` im Browser | ja (**gewählt**) |
+| **gRPC** | Dasselbe Prinzip aus Dienst und Methode, aber über binäres protobuf und HTTP/2; schnell und gut für Streaming geeignet | ja (**zwischen Diensten**) |
+| gRPC-web | Eine für den Browser angepasste Variante von gRPC | ja (bei Bedarf) |
+| GraphQL | Abfragesprache, mit der man genau die benötigten Felder anfordert | teilweise (**nur für lesende Abfragen**) |
+| WASM | Führt Rust-Code direkt im Browser aus | nein (Technik für die Oberfläche) |
+
+- **APIs, die von Browseroberflächen oder per `curl` aufgerufen werden, verwenden Connect** (POST; JSON wird mit RS-JSON gelesen und geschrieben). WASM im Browser kann kein reines gRPC sprechen. Mit Connect bleibt es bei einem gewöhnlichen `fetch`, und `prost` ist nicht nötig – die WASM-Datei wird dadurch nicht größer.
+- **Für die Kommunikation zwischen Diensten (Server zu Server, rechenintensive Aufgaben, Streaming) wird gRPC eingesetzt.** In den meisten Fällen reicht Connect aus; auf gRPC wird nur dort umgestellt, wo Streaming tatsächlich gebraucht wird.
+- **GraphQL dient ausschließlich lesenden Abfragen**, wenn mehrere Informationen gebündelt abgefragt werden sollen. Für Schreibzugriffe (Operationen) wird es nicht verwendet.
+- **WASM bleibt die Technik für die Oberfläche.** Geändert hat sich lediglich, dass die aufgerufene API nun auf Connect beruht.
+- Schnittstellen, deren Form durch einen externen Standard festgelegt ist (ACME, OAuth-Callbacks, Webhooks von Drittanbietern, Health-Checks, statische Dateien, OTLP), bleiben gewöhnliches HTTP.
+- **Im Zweifel: Connect.**
+
+### Русский (перевод выполнен с помощью ИИ и литературно отредактирован; носителями языка пока не проверен)
+**Это не варианты, из которых нужно выбрать один, а технологии разных уровней.** Заменить REST могут только Connect, gRPC и GraphQL; WASM же — это способ создания пользовательского интерфейса.
+
+| Термин | Что это | Заменяет REST? |
+|---|---|---|
+| REST | Стиль построения API, при котором операции выражаются через URL и HTTP-методы | отменяется |
+| **Connect** | `POST /Сервис/Метод` с телом в формате JSON; вызывается как из `curl`, так и из браузерного `fetch` | да (**выбран**) |
+| **gRPC** | Тот же принцип «сервис — метод», но поверх двоичного формата protobuf и HTTP/2; работает быстро и хорошо подходит для потоковой передачи | да (**для связи между сервисами**) |
+| gRPC-web | Адаптированный для браузера вариант gRPC | да (при необходимости) |
+| GraphQL | Язык запросов: клиент запрашивает ровно те поля, которые ему нужны | частично (**только запросы на чтение**) |
+| WASM | Позволяет выполнять код на Rust прямо в браузере | нет (технология для интерфейса) |
+
+- **API, которые вызываются из браузерных интерфейсов или через `curl`, строятся на Connect** (POST; JSON читается и записывается через RS-JSON). Браузерный WASM не умеет работать с «чистым» gRPC. С Connect достаточно обычного `fetch`, а `prost` не требуется — размер WASM-файла не увеличивается.
+- **Для обмена между сервисами (сервер — сервер, ресурсоёмкие задачи, потоковая передача) применяется gRPC.** В большинстве случаев достаточно Connect; на gRPC переходят только там, где потоковая передача действительно необходима.
+- **GraphQL используется только для чтения**, когда нужно получить сразу несколько связанных данных. Для записи (операций) он не применяется.
+- **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
+- Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
+- **Если есть сомнения — выбирайте Connect.**
+
+## REST→Connect移行状況(2026-11-05、API方針〈REST全廃・gRPC/Connect〉の反映)
+- 管理操作は Connect の単純呼び出し `POST /open_runo.aruaru.admin.v1.Admin/<Method>`(JSON、`x-admin-token`認証、失敗は`{"code","message"}`、JSONはRS-JSON `parse_secure`で上限・重複キー検査)。実装は`crates/aruaru-graphql/src/connect.rs`(既存の管理リゾルバを呼ぶ薄い層。21メソッド: Registry/RegistrySummary/ListBackups/GetBackupSchedule/ClusterStatus/ListFederatedSources/PreviewSource/ExplainDistributed/CreateBackup/RestoreBackup/SetBackupSchedule/ClusterNodeOp/RebalanceCluster/ClusterPropose/RegisterFederatedSource/DropFederatedSource/FederatedQuery/TestSourceConnection/RunMigration/CrawlRegistry/TestRegistryConnection)。
+- **移した(REST削除)**: `/admin/backup*`・`/admin/migrate/{test,preview,run,instance}`・`/admin/federation*`・`/admin/cluster*`・`/admin/registry*`(19経路)。呼び出し元の管理画面(Tauri)とAndroidをConnectへ変更。`/admin/migrate/instance`は中身が「受理」を返すだけのスタブだったため削除(Tauriの`migrate_instance`は未実装エラー)。
+- **残した(2026-11-05 続き)**: なし(自分たちのAPIとしてのRESTは全て移行)。移した先: `/admin/closed-timestamp/publish`・`/admin/disaster-email-backup*` → `POST /open_runo.aruaru.admin.v1.AdminNode/{ClosedTsPublish,SetDisasterEmailBackup,VerifyDisasterEmailBackup}`(`admin_connect_routes`、認証は `/admin` と同じ `check_admin_auth`)、デモweb `/api/status`・`/api/rebalance` → `POST /open_runo.aruaru.web.v1.Demo/{Status,Rebalance}`(上流呼び出しも管理Connectへ。デモは旧 `/admin/cluster` を叩いて本番で404になっていたのを修正)、`columnar_pod` `/columnar/*` → `POST /open_runo.aruaru.columnar.v1.Columnar/{Status,Prune}`(JSON本文 `table` 必須)。ノード間の旧REST受信 `/admin/raft/{append,vote}`・`/admin/closed-timestamp/receive` は削除済み。
+- **既知の差**: 旧 `closed_ts_receive` は受信時にローカルHLCを前進させていたが、バイナリ受信経路(`serve_binary_raft`)にはHLC観測の配線が無い(元からの差。別途対応が必要)。
+- **例外**: `/healthz`、`/graphql/sdl`(Cosmo規格)、PostgreSQLワイヤー互換、`/graphql`(問い合わせ)。
+- **未了**: 管理系GraphQL Mutationの削除(Connect層が GraphQL 文書を内部実行しているため、Mutation を消すには先に resolver を共有関数へ切り出す必要がある。未着手)、`admin.rs` の未使用ハンドラ連鎖(移行済みの旧RESTハンドラ→`now`/`tcp_reachable`/`wire_for_source`/`cluster::{build_cluster,propose_*,summarize}`)の削除(連鎖が深く、ビルド警告のみ)、Tauri画面のブラウザ確認(未ビルド)、`columnar_pod` の実プロセス確認。
+
+## REST全廃 再確認(2026-11-07、親セッション指示の確認作業)
+- origin/main(568fb83)を新規cloneして再調査。**自前APIとしてのRESTは0本**(移した: 管理19+ノード間3+デモ2+columnar 2+メール退避ほか。version-controlの「残り8本」は古い数え)。例外は `/healthz`・`/graphql/sdl`(Cosmo規格)・PostgreSQLワイヤー・`/graphql`(問い合わせ)。
+- **本番(VPS)確認**: 本番 `aruaru-server`(:4001)は移行後のバイナリ(Connect 認証なし401)。**`realdata-aruaru-db`(:14001、pid古い)は移行前のプロセスのまま**(Connect 404)。ディスク上のバイナリは新しいため再起動で入れ替わるが、別データのサービスなので未再起動(判断待ち)。
+- 古いコメント(Tauri `main.rs` 冒頭・`admin_post`、Android KDoc)の旧REST表記を修正。
+- **未了(変わらず)**: 管理系GraphQL Mutationの削除、`admin.rs` の未使用旧ハンドラ連鎖(`migrate_instance` 等)の削除、Tauri画面のブラウザ確認。
+
+## 2026-11-08 `.nest("/admin", admin_routes)` の実コード確認
+- `aruaru-server/src/admin.rs` の `admin_routes()` は、認証(`check_admin_auth`)を巻いた**ルート0本**の空の `Route`(中身は全てGraphQL/Connectへ移行済み)。旧RESTは残っていない。ノード間配布・メール退避は `AdminNode` のConnect(`admin_connect_routes`)。
+- 残るHTTP: `/healthz`(例外)、`/graphql`・`/graphql/sdl`、Connect。`/v1/keys/self-issue` はGraphQL `selfIssueKey` mutation に移行済みでRESTは無い。集計の「残8」は古い数えで、移行対象は0本。
+
+## 旧REST残骸の削除(2026-11-09)
+`crates/aruaru-server/src/admin.rs` の未使用だった旧RESTハンドラ23本(backup/migrate/federation/cluster/registry、`migrate_instance` スタブ含む)・リクエスト型8個・補助関数(`now`/`tcp_reachable`/`wire_for_source`)と、`cluster.rs` の `build_cluster`/`propose_write`/`propose_commit`/`summarize` を削除(約540行)。WSL(Ubuntu-24.04)で `cargo check`(警告は未読フィールド `engine`/`registry`/`backups` と `replicator` のみ)・`cargo test -p aruaru-server -p aruaru-graphql` 全通過。実サーバーの起動確認・本番反映は未実施(挙動は変わらない削除のため。次の通常ビルド時に反映される)。**未了**: 管理系GraphQL Mutationの削除(Connect層がGraphQL文書を内部実行しているため先にresolverの共有関数化が要る)、Tauri画面のブラウザ確認。
+
+## 管理 GraphQL Mutation を公開 /graphql から撤去(2026-11-09)
+- **公開 `/graphql` と `/graphql/sdl` は `PublicSchema`(Query + `VcsMutation`。管理 Mutation = `AdminMutation` なし)**。内部の `AruaruSchema`(管理 Mutation あり)は Connect 層(`connect.rs`)だけが使う。`AdminCtx` は `Clone`。方針: 管理操作は Connect/gRPC、GraphQL は問い合わせ。
+- **Connect に追加**(以前 GraphQL だけで呼べた11操作): `ObjectTableCommit`/`ObjectTablePrune`/`RevokeKeys`/`ClosedTsRegisterRange`/`ClosedTsAdvance`/`WalAppend`/`WalCreateImageLayer`/`ShardedStorePut`/`MultiRaftSplit`/`MultiRaftMerge`/`EphemeralQuery`(計32メソッド)。変数名は GraphQL の引数名(camelCase)。テスト `every_op_document_parses_and_names_exist_in_the_schema` で文書の構文・フィールド名・引数型をスキーマと照合。
+- **Web 管理画面(`aruaru-admin/core/src/api/invoke.ts`)**: 管理操作を `connect()` へ移行。**以前から不整合だった点も修正**: (1) `x-admin-token` を一切送っていなかった → `localStorage["aruaru.adminToken"]` または `VITE_ARUARU_ADMIN_TOKEN` から送る(`config.ts` の `adminToken()`)、(2) `explain_distributed` を mutation で呼んでいた(実体は Query)、(3) `set_parallel_config` は存在しない `setParallelConfig` を呼んでいた(2026-08-29撤廃済み)→ 「`aruaru.yaml: query.parallel` で設定」と明示エラーに。TypeScript は構文・型検査のみ(tsc)、ブラウザでの画面確認は未実施。
+- **確認(WSL実サーバー)**: 公開 `/graphql` の `mutation{rebalanceCluster}` は `Unknown field`、Query は 200、`/graphql/sdl` に管理 Mutation なし。Connect は認証なし401・重複キー400・`RebalanceCluster`/`ShardedStorePut`/`RevokeKeys`/`MultiRaftSplit` 200、旧 `/admin/cluster` 404。`cargo test -p aruaru-server -p aruaru-graphql` 全通過。
+- **未了**: Web 管理画面のブラウザ確認(トークン入力UIは無く、localStorage か環境変数で設定)、Tauri 画面のブラウザ確認、(本番反映は下記で完了)。
+
+- **本番反映(2026-11-09 完了)**: WSL(Ubuntu-24.04)でリリースビルド(既定機能、GLIBC_2.39)→ scp → `target/release/aruaru-server` を入れ替え(旧は `aruaru-server.before-20261109`)→ `aruaru-server.service`・`realdata-aruaru-db.service` を再起動。確認: 両ポート(4001/14001)で healthz 200・Connect 認証なし401、公開 `/graphql` の管理 Mutation は `Unknown field`。VPS上のクローンは `849f082` のまま(未コミット変更1件があるため `git pull` していない。ソース整列は次回)。
+
+## Web管理画面(aruaru-admin)のブラウザ確認と白画面バグ修正(2026-11-17)
+- ローカルで `aruaru-server`(`ARUARU_DB_ADMIN_TOKEN` 設定、`--gql-port 4000`)+ `aruaru-db-admin-web`(vite、5174)を起動し、ブラウザで全10画面を通した。**修正前は白画面**だった(いずれも以前からの不具合): (1)`core/src/api/config.ts` に `serverBase`/`setServerBase`/`clearServerBase` が無く `App.tsx` が読み込めない → 追加、(2)web版のviteが `@tauri-apps/plugin-dialog` を解決できず500 → `aruaru-db-admin-web/src/tauri-dialog-stub.ts` へalias、(3)クラスタ画面が camelCase の応答を snake_case 前提で読み落ちる → `mapClusterStatus`、(4)対応DB画面がサーバーの日本語ステータスで落ちる → `mapRegistry`で正規化。
+- 確認結果: 全10画面が描画、`CreateBackup` は token なし=401・token あり=200(画面は「完了」)、`RebalanceCluster` 200、旧RESTの呼び出し0。`vite build` 成功。`tsc --noEmit` は `@types/react` 解決などの型エラーが残る(以前から、未対応)。ダッシュボード・ブランチ・クエリは「実装中」のスタブ。
+- 本番(VPS)に出ているのは `web/` のデモUIで、`aruaru-db-admin-web` は配備していない(Dockerfile/nginx.confのみ)。
+
+
+## HANDOFF追記(2026-11-18 続き33) Python asyncpg 実サーバ往復 green・`close()` ハング修正(別アカウントでの再開用)
+**日本語**
+- リポジトリ: `aon-co-jp/aruaru-db`(`F:unoepositoryruaru-db`)。コミット `e9bf50b`(push済み)。VPS は `1566c0b` 反映済みのまま(今回はクライアント側のみの変更で再配備不要)。
+- `clients/python-aruaru-db`: `live-check.py` が実サーバ(`--pg-port 5433`)で `as-of qty='1' / latest qty='5'` / `OK`。単体4件 green。**「`connect()` でハング」は誤診**で、実際は最後の `close()` が固まっていた(aruaru-server は Terminate 後もソケットを閉じない)。`AruaruDb.close(timeout=2.0)` を追加(時間切れで `terminate()`)。`db.raw.close()` ではなく `db.close()` を使う。
+- 落とし穴: `aruaru-server` の既定 pg ポートは **5432**(`--pg-port 5433 --gql-port 4001 --data <dir>`、`ARUARU_USERS=app:secret`)。`../RS-JSON` のクローンが古いと `rust_json::parse_secure` が無くビルドが落ちる(履歴が書き直されているので `git pull` ではなく `fetch`+`reset --hard origin/main`)。ビルドで `Cargo.lock` が変わるので `git checkout Cargo.lock` で戻す。`data/` は試験の残り(未追跡、コミットしない)。
+- 未了: `aruaru-wire` の型付き結果(列OIDを実型に)、GPU側(`open-cuda/OmniGPU-Design.md §12.4` の `dxil-spirv` vs `naga`、macOS/MoltenVK 実機)、aruaru-llm スライスC(`ARUARU_LLM_ENABLE_*` の能力交渉自動化)。
+**English**
+- Repo: `aon-co-jp/aruaru-db` (`F:unoepositoryruaru-db`), commit `e9bf50b` (pushed); the VPS stays at `1566c0b` (client-only change, no redeploy needed).
+- `clients/python-aruaru-db`: `live-check.py` passes against a real server (`as-of qty='1' / latest qty='5'` / `OK`), 4 unit tests green. The old "hang on `connect()`" was a misdiagnosis: the final `close()` hung because aruaru-server does not close the socket after Terminate. Added `AruaruDb.close(timeout=2.0)` (falls back to `terminate()`); use `db.close()`, not `db.raw.close()`.
+- Pitfalls: the default pg port is **5432** (`--pg-port 5433 --gql-port 4001 --data <dir>`, `ARUARU_USERS=app:secret`); a stale `../RS-JSON` clone lacks `parse_secure` and breaks the build (history was rewritten: `fetch` + `reset --hard origin/main`, never `pull`); builds rewrite `Cargo.lock` (`git checkout Cargo.lock`); `data/` is test residue (untracked, do not commit).
+- Open: typed result columns in `aruaru-wire`; GPU side (`dxil-spirv` vs `naga`, macOS/MoltenVK); aruaru-llm slice C.
+
+### 再開用メッセージ / Resume message
+**日本語**: `F:unoepositoryruaru-db\CLAUDE.md` 末尾「続き33」を読んでから再開。Python asyncpg 往復は完了済み。次は(1)`aruaru-wire` の型付き結果、(2)GPU `OmniGPU-Design.md §12.4`、(3)aruaru-llm スライスC。REST新設禁止(Connectのみ)、秘密は出さない、実機で確認してから完了報告、返答は日本語のみ、push・タグは確認してから。
+**English**: Read "続き33" at the end of `F:unoepositoryruaru-db\CLAUDE.md`, then resume. The Python asyncpg round trip is done. Next: (1) typed results in `aruaru-wire`, (2) GPU `OmniGPU-Design.md §12.4`, (3) aruaru-llm slice C. No new REST (Connect only), never print secrets, verify on real systems before reporting done, reply in Japanese only, confirm before pushing or tagging.
