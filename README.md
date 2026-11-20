@@ -1,0 +1,508 @@
+# aruaru-DB 🦀
+
+> **2026-08-29〜31 更新(管理面の抜本再設計 = 2026 年最新設計として進行中)**:
+> `/admin/*` の REST を GraphQL へ 1 本ずつ移す手法は *アンチパターンの移送* に
+> すぎない、との指摘を受け、正本の設計文書
+> **[`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)** を新設して
+> 抜本再設計へ移行。新・設計哲学: **すべてを「望ましい状態の宣言」+
+> reconciliation で表し、データプレーンに命令的 RPC を置かない**
+> (K8s/GitOps・WunderGraph Cosmo・TiDB/TiFlash・SPIFFE の共通解)。
+> `aruaru-server` の HTTP は最終的に `/graphql`・`/graphql/sdl`・`/health*`・
+> `/metrics` のみとし、**`/admin/*` を含む REST を全撤廃**。運用設定は
+> 宣言的 `aruaru.yaml` + ホットリロード。
+> **2026-08-31**: 付録 A を「CockroachDB × Snowflake ハイブリッド変種」の
+> 2026 年最新設計として大幅拡充(英・日・独で一次論文/GitHub を再調査、
+> TiDB/TiFlash の DeltaTree・CockroachDB の closed timestamp/Pebble・
+> Snowflake の不変マイクロパーティション・Neon vs Aurora の WAL 分離・
+> ClickHouse SharedMergeTree・Iceberg/Delta/Hudi・Photon/DuckDB の
+> 型認識軽量圧縮を**実装方法まで**整理し、Raft-Learner 行→列変換レプリカ・
+> HLC・deletion vector の取り込みを決定)。進捗: **P0〜P3 完了(REST完全撤廃
+> は`closed-timestamp`・`wal-service`・`sharded-store`・`ephemeral-query`・
+> `multi-raft`の全5機能で完了、実プロセスHTTP E2E込み)**。続けて要求③
+> 実装トラックへ着手: **HLC**(`aruaru-dist::hlc`)、**ColumnarApplier**
+> (A.6-2本命、Raft-Learner上の行→列非同期変換レプリカ。`--columnar-learner`
+> で実際に2プロセス間の実HTTPまで検証済み)、**deletion vector**
+> (A.6-4段階1、`prune_range`/`prune_equality`への配線込み)を実装。
+> 詳細・進捗・復活用メッセージは[`CLAUDE.md`](CLAUDE.md)冒頭
+> 「🔄 セッション再開用メモ」と同日HANDOFF(続き13〜18)。
+> **2026-09-02(続き20〜22)**: **A.6-4 段階2 = base+delta の Merge-on-Read**
+> (`ColumnarApplier` を都度フル再構築から delta 蓄積+閾値 compaction へ格上げ、
+> DELETE/UPDATE で deletion vector を書き込み)、**HLC 再設計**
+> (`as_nanos()` の `pt<<16` u64 オーバーフローを案B〈物理を 65µs 粒度へ
+> 切り捨て下位 16bit に論理を収める〉で修正、`closed_ts` 系へ配線)を実装。
+> 続いて**次フェーズ一括(ビルドまで)**: `aruaru.yaml: htap` セクション、
+> `Query.htapReplicas` 相当の枝刈り込み観測 API
+> (`ColumnarApplier::prune_range_preview`/`prune_equality_preview` +
+> `GET /columnar/:table/prune`)、**A.6-3**(`Applier::apply_at` で
+> Raft index + MVCC〈commit 通し番号〉を記録、`read_at_index` で staleness
+> 検証、未達なら 409)、**HLC `max_offset`**(`try_update`/
+> `try_observe_ordinal`、`follower_read.max_offset_ms`)を実装。
+> HLC 案A 全面移行は `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来。
+> **2026-09-02(続き23)**: `Query.htapReplicas` を GraphQL 単一サーフェスへ
+> **正式公開**。`aruaru.yaml: htap.columnar_replicas: true` で本番
+> `aruaru-server` が本番 `QueryEngine` を共有した**同居 `ColumnarApplier`**
+> (`QueryEngine::set_columnar_observer` の通知で追従)を立て、`htapReplicas`
+> が TiFlash `INFORMATION_SCHEMA.TIFLASH_REPLICA`(PROGRESS/AVAILABLE)相当の
+> 同期状態 + 枝刈り込みプレビューを返す。設計は TiFlash / CockroachDB の
+> レプリカ観測手法の WebSearch 調査を反映。実 HTTP `/graphql` E2E 済み
+> (`execSql` で書き込み→自動追従、prune/DELETE/未知テーブル/`max_offset`
+> リモート値拒否まで確認)。**続き24**: `Query.htapReplicasAll`(全テーブル
+> 一覧、TiFlash `TIFLASH_REPLICA` が全 (db,table) 行を返すのと同様、テーブル
+> 名を知らなくても全列レプリカの同期状態を一覧できる)を追加。
+> **続き26**: **HLC 案A 全面移行(P-HLC-3)**。一次資料の再調査(CockroachDB
+> `util/hlc` は WallTime/Logical をパックせず別フィールド + Mutex、uhlc-rs も
+> 同様)を踏まえ、内部を `HlcTimestamp { wall_nanos: u64(切り捨て無し),
+> logical: u32, synthetic: bool }` へ刷新——シフト・パックが無いので u64
+> オーバーフロー構造的に不可能。外向きの u64 ordinal(`closedTsAdvance` 等)は
+> 案B の 65µs 射影として**互換維持**。新 API `Query.hlcNow` / `now_hlc` /
+> `uncertainty_upper`。実 HTTP E2E 済み。
+> **続き27**: **P-HLC-3c/3d**。3c = `closed_ts` の follower read staleness を
+> CockroachDB の uncertainty interval(`read_ts + max_offset` の全域が
+> 閉じ済み)へ、GraphQL `planFollowerRead(mode: "uncertainty-safe")`。
+> 3d = **外向き u64 射影からシフト・パック・切り捨てを完全撤去**
+> (`as_ordinal() = wall_nanos + logical`。`& !0xFFFF` バケットも
+> `advance_locked` のバケット分岐も削除、CockroachDB `hlc.go` `Now()` と
+> ビット一致)——u64 はフル精度 Unix ナノ秒スケールになり、65µs 粒度の
+> 代償が消滅。実 HTTP E2E で `hlcNow` の `wallNanos == ordinal` を確認。
+> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜27)。
+
+> 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
+
+> **The hybrid distributed database that speaks Git.**  
+> CockroachDB の分散強整合 × Snowflake のストレージ/コンピュート分離 × Git-on-SQL バージョン管理 ── すべてを Pure Rust で。
+
+[![Version](https://img.shields.io/badge/version-0.5.0-orange.svg)](https://github.com/aon-co-jp/aruaru-db/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![CI](https://github.com/aon-co-jp/aruaru-db/actions/workflows/ci.yml/badge.svg)](https://github.com/aon-co-jp/aruaru-db/actions)
+[![Discord](https://img.shields.io/badge/Discord-community-5865F2.svg)](https://discord.gg/aruaru-db)
+
+📖 他言語: [日本語](README-Japan.md) / [English](README-English.md) /
+[中文](README-Chinese.md) / [한국어](README-Korea.md) / [Español](README-Spain.md) /
+[Français](README-France.md) / [Deutsch](README-Germany.md) / [Italiano](README-Italy.md) /
+[Русский](README-Russia.md) / [العربية](README-Arabic.md)
+
+---
+
+## ✨ なぜ aruaru-DB か
+
+| 機能 | CockroachDB | Snowflake | **aruaru-DB** |
+|------|------------|-----------|---------------|
+| 分散強整合 (Raft) | ✅ | ❌ | ✅ |
+| ストレージ/コンピュート分離 | ❌ | ✅ | ✅ |
+| 列指向 OLAP (Arrow/DataFusion) | ❌ | ✅ | ✅ |
+| Git-on-SQL (branch / merge / diff) | ❌ | ❌ | ✅ |
+| Versionless GraphQL API | ❌ | ❌ | ✅ |
+| Tauri 管理 GUI | ❌ | ❌ | ✅ |
+| 移行ツール (Postgres / MySQL / CSV) | △ | △ | ✅ |
+| **完全 OSS (Apache-2.0)** | ❌ (2024〜) | ❌ | ✅ |
+| Pure Rust | ❌ (Go) | ❌ | ✅ |
+
+---
+
+## 🏗️ アーキテクチャ概要
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Layer 3 : Access                                        │
+│  pgwire (PostgreSQL互換)  │  GraphQL (Poem/async-graphql)│
+│  REST API                 │  Tauri Admin GUI             │
+├──────────────────────────────────────────────────────────┤
+│  Layer 2 : Query & Distribution                          │
+│  HTAP Router  │  DataFusion (OLAP)  │  openraft (Raft)  │
+│  MVCC         │  Range Sharding     │  SQL Planner       │
+├──────────────────────────────────────────────────────────┤
+│  Layer 1 : Storage                                       │
+│  Row Store (fjall LSM)  │  Columnar (Arrow / Parquet)   │
+│  Version Tree (Prolly)  │  WAL (Write-Ahead Log)        │
+└──────────────────────────────────────────────────────────┘
+```
+
+詳細は [ARCHITECTURE.md](ARCHITECTURE.md) と [docs/DATABASE.md](docs/DATABASE.md) を参照。
+
+---
+
+## 🚀 クイックスタート
+
+```bash
+# サーバ起動 (PostgreSQL ポート 5432 + GraphQL :4000)
+cargo run -p aruaru-server -- --data ./data --raft-id 1
+
+# psql で接続
+psql -h localhost -U root -d aruaru
+
+# GraphQL エンドポイント
+open http://localhost:4000/graphql
+```
+
+### Tauri Admin GUI
+
+```bash
+cd admin
+npm install
+npm run tauri dev
+```
+
+> **2026-07-27時点の正直な開示**: `admin/`は以前、`tauri.conf.json`・
+> `build.rs`・アイコン・Vite/tsconfigのブートストラップ一式が欠落しており
+> `npm run build`/`cargo build`のどちらも一度も成功していなかった
+> (ページ実装自体は先行していたが、実行できる状態ではなかった)。
+> 2026-07-27にこの最小限のスキャフォールドを補い、両方のビルドが実際に
+> 成功する状態にした。ディザスタ用メール退避の設定フォームもこの時点で
+> 追加済み。実Tauriネイティブウィンドウでの起動確認・実SMTP接続は
+> 引き続き未検証(詳細は`CLAUDE.md`のHANDOFF参照)。
+
+---
+
+## 📦 クレート構成
+
+| クレート | 役割 |
+|---------|------|
+| `aruaru-core` | ストレージエンジン・MVCC・Git-on-SQL バージョン管理 |
+| `aruaru-dist` | openraft 統合・Range シャーディング・ノード管理・Raftコミット×open-raid-zスナップショット連携(`snapshot_pairing`、2026-07-13追加)・Multi-Raft(CockroachDB/TiKV方式、Range単位の独立合意グループ、`multi_raft`、2026-07-23追加) |
+| `aruaru-query` | SQL パーサ・HTAP ルーター(TiDB/TiFlash方式の行→列インクリメンタル同期`OlapCache`、2026-07-23追加)・DataFusion 統合 |
+| `aruaru-wire` | PostgreSQL ワイヤプロトコル (pgwire) |
+| `aruaru-graphql` | Versionless GraphQL + Poem HTTP サーバ |
+| `aruaru-registry` | 対応DBレジストリ (150+件) + 毎日クロール + 取り込みアダプタ |
+| `aruaru-migrate` | Postgres / CockroachDB / Snowflake / MySQL / CSV 移行ツール |
+| `aruaru-backup` | バックアップ・リストア・ポイントインタイムリカバリ (Parquet) |
+| `aruaru-server` | メインバイナリ (全クレートの統合エントリポイント) |
+
+---
+
+## 🌿 Git-on-SQL の使い方
+
+> ⚠️ 以前の版に載っていた `ALTER TABLE` と `SELECT aruaru_diff(...)` は
+> **現在のSQLパーサーには実装されていません**(コード確認済み、2026-07-12)。
+> 以下は実際に動作する構文のみで置き換えたものです。
+
+```sql
+-- ブランチ作成 → 切り替え
+SELECT aruaru_branch('feature/new-schema');
+SELECT aruaru_checkout('feature/new-schema');
+
+-- このブランチでデータ変更 (テーブル自体は事前に CREATE TABLE 済みとする)
+INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
+
+-- コミット
+SELECT aruaru_commit('Add score for Alice');
+
+-- ログ確認
+SELECT * FROM aruaru_log LIMIT 10;
+
+-- main へ戻ってから feature をマージ (fast-forward)
+-- 注意: aruaru_merge は引数を1つだけ取り、「現在のブランチ」に
+-- 指定ブランチをマージする。旧版README にあった
+-- aruaru_merge('feature/new-schema', 'main') という2引数呼び出しは
+-- 実装(1引数のみ受け付ける)と一致しておらず、動作しません。
+SELECT aruaru_checkout('main');
+SELECT aruaru_merge('feature/new-schema');
+```
+
+### 過去コミット時点の状態を問い合わせる (`AS OF COMMIT`, 2026-07-13 追加)
+
+VersionLessAPI(エンドポイントはバージョン番号を持たない)と Git 版管理
+(データはコミット単位で完全な履歴を持つ)のハイブリッドの**読み出し側**。
+`WHERE pk = 'value'` で行を1件特定できる場合、`AS OF COMMIT '<commit_id>'`
+を付けると最新値ではなくその commit_id 時点の値を返します:
+
+```sql
+INSERT INTO items (id, qty) VALUES ('sword', 1);
+SELECT aruaru_commit('first grant');          -- commit_id 例: abc123...
+
+UPDATE items SET qty = '5' WHERE id = 'sword';
+SELECT aruaru_commit('quantity bumped');
+
+SELECT qty FROM items WHERE id = 'sword';                          -- 5 (最新)
+SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'abc123...'; -- 1 (過去)
+```
+
+内部では commit の `root_hash` から Prolly Tree を再構築して読み出すため、
+最新の可変テーブル状態を経由しません。**2026-09-03 修正**: `AS OF COMMIT`
+も通常の `SELECT` と同じく**列射影を尊重**するようになりました
+(旧: 常にフル行を返していた。`SELECT *` はフル行、列を並べればその順・
+その列だけ、不明列はエラー)。単一行と WHERE 無しフルスキャンの両方に対応。
+
+**クライアント接続**(Java / Rust+Axum・Poem・RPoem / Python+FastAPI・
+Django・Flask / PHP+Laravel / Go / Node / .NET / COBOL / メインフレーム
+z/OS ほか)は [`docs/CLIENTS.md`](docs/CLIENTS.md) を参照 —
+aruaru-db は pgwire(:5433)+ GraphQL/HTTP(:4001)の 2 標準契約だけを
+公開するので、各言語の**標準 PostgreSQL ドライバでそのまま繋がり**、
+独自ドライバは不要です。Git-on-SQL を慣用 API で薄くラップした公式
+コネクタ(`aruaru-db-connector` (Rust) / `aruaru-db` (PyPI) /
+`@aruaru/db` (npm) / `aruaru/db` (Composer))は [`clients/`](clients/)。
+**現在の制限**: 結果列は今のところすべて `VARCHAR`(text)で返るため、
+`get::<i32>` 等の型付きゲッターではなく文字列で受けて parse してください
+(`docs/CLIENTS.md §5.1`)。
+
+ブランチ間の diff は SQL 関数としては提供されていません。`aruaru-graphql` の
+GraphQL API 経由で取得します:
+
+```graphql
+query {
+  diff(from: "main", to: "feature/new-schema") {
+    added
+    removed
+    modified
+  }
+}
+```
+
+### UPSERT (2026-07-12 追加)
+
+`ON CONFLICT ... DO UPDATE` / `DO NOTHING` に対応しています
+(open-runo が生成するUPSERT文との互換性のために追加):
+
+```sql
+-- 初回は新規行としてINSERT、2回目以降(同じidが既にあれば)は
+-- balance列だけをEXCLUDED(今回渡した新しい値)で上書き更新
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance;
+
+-- 既に存在する場合は何もしない (「無ければ作る」の冪等パターン)
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO NOTHING;
+```
+
+> 現在の実装では、衝突判定はテーブルの**先頭列(=PK)**の重複でのみ行われます。
+> `ON CONFLICT (col)` の `col` は先頭列と一致している必要があります(異なる列を
+> 指定するとエラーになります)。
+
+---
+
+## 🔗 関連プロジェクト
+
+`open-web-server` を中心に `poem-cosmo-tauri`/`open-runo`・PostgreSQL・
+`open-raid-z` と組み合わせ、3Dオンラインゲームの課金アイテム・金融/証券
+データを紛失させないための目標アーキテクチャがある(2026-07-11改訂:
+通信層は TCP-IP・UDP-IP・QUIC/MPQUIC・MPTCP/SCTP の四重化、DB書き込みは
+PostgreSQL・aruaru-db・マルチリージョン同期レプリケーション・独立監査ログ
+の四重化)。aruaru-db はその分散 Git-on-SQL データ層として関与し、
+VersionLessAPI とGit管理のハイブリッド版管理も担う。現状はTCP-IP・UDP-IP
+のみ実装済みで他は未着手(詳細は `open-web-server` の `README.md`/
+`CLAUDE.md` 参照)。
+
+---
+
+## 🤝 コントリビュート
+
+世界中のボランティアによってメンテナンスされています。
+
+- **Issues**: バグ報告・機能提案は GitHub Issues へ
+- **good-first-issue** ラベルから始めてください
+- `CONTRIBUTING.md` を必ずお読みください
+- Discord: コミュニティチャンネルで議論
+- 開発時、技術選定や仕様確認で迷ったら学習データの推測に頼らず、
+  日本語・英語両方での検索や GitHub 調査で裏付けを取ることを推奨します
+
+---
+
+## 🕒 Closed Timestamp / Follower Read (2026-08-21 追加)
+
+「CockroachDB の Raft 強整合」と「Snowflake のストレージ/コンピュート分離」を
+実際に両立させている共通の要素技術として、*読み取りをリーダー
+(leaseholder)以外のレプリカへ逃がす仕組み* が CockroachDB(closed
+timestamp)・TiKV/TiDB(safe-ts による Stale Read)・YugabyteDB
+(`yb_follower_read_staleness_ms` による bounded staleness)のいずれにも
+存在することを調査で確認しました。aruaru-db にはこの概念が**一切
+存在しなかった**(コードを grep して裏取り済み)ため、
+`crates/aruaru-dist/src/closed_ts.rs` として実装しました。
+
+- Range 単位の closed timestamp を `now - target_lag`(既定3秒)まで前進。
+  ただし**進行中の書き込みの最小時刻を跨がない**(跨ぐと保証が破れる)。
+- side transport 相当の配布(`publish_to`)で、読み取り専用ノード側の
+  コーディネータへ closed timestamp を伝搬(冪等)。
+- bounded staleness 交渉: 関与する全 Range の closed timestamp の最小値を
+  読み取り時刻に採用。上限超過・未前進・未知 Range は leaseholder へ
+  フォールバック(`ReadPlan::RouteToLeaseholder`)。
+- `MultiRaftCluster::propose_at` / `commit_and_apply_at` /
+  `plan_bounded_staleness_read` として Multi-Raft へ配線済み。
+
+**正直な現状**: 実装・検証は `cargo test -p aruaru-dist`(50 passed /
+0 failed)・`cargo test --workspace`(全て ok)までで、(1) 管理REST API への
+公開と実プロセスでの E2E 確認、(2) side transport のネットワーク越し配線、
+(3) 判定結果を既存の `AS OF COMMIT` 読み取り経路へ橋渡しすること、の3点は
+**未実施**です。また時刻は呼び出し側が渡す論理ナノ秒で、HLC・クロック
+スキュー上限は扱いません。次回調査・開発の目星(Neon の pageserver/
+safekeeper 分離、SingleStore の rowstore/columnstore 同居、Databend/
+RisingWave のオブジェクトストレージ直結、CockroachDB/TiDB Serverless の
+弾力的コンピュート)は [CLAUDE.md](CLAUDE.md) の HANDOFF 節に整理して
+あります。
+
+---
+
+## 🧱 ストレージ/コンピュート分離の要素技術 (2026-08-22 追加)
+
+「Snowflake と CockroachDB の両方の特性を持つハイブリッド DB」の要素技術を
+日本語・英語・中国語・韓国語で横断調査し、一次資料で裏取りしたうえで
+優先度の高い3件を実装しました(前回追加の closed timestamp / follower read
+とは別軸の追加です)。
+
+1. **WAL サービス (safekeeper) と Pageserver の分離 — Neon 方式**
+   (`crates/aruaru-dist/src/wal_service.rs`)
+   `neondatabase/neon` の `docs/walservice.md`・`docs/safekeeper-protocol.md`・
+   `docs/pageserver-storage.md` で確認した設計を実装:
+   - WAL は複数 safekeeper へ送り、**過半数が flush した時点で durable**。
+     `commitLSN` は全 safekeeper の `flushLSN` を並べた **quorum 番目**。
+   - proposer は起動ごとに **term** が増え、古い proposer を fence する
+     (= 単一 primary 強制 / split-brain 防止)。
+   - Pageserver は safekeeper 群から WAL を取り込み、
+     **`get_page_at_lsn` で任意 LSN のページを image layer + delta layer から
+     再構成**。未着 LSN の要求は拒否し、`max_replication_lag` で
+     バックプレッシャをかける。image layer 生成 (compaction) より前の
+     LSN は再構成不能であることを `BelowGcCutoff` として明示。
+
+2. **セグメント (Row Group / block) 単位のゾーンマップ枝刈り**
+   (`crates/aruaru-query/src/olap.rs`)
+   SingleStore の Universal Storage (segment 単位の columnstore)、
+   Databend の block 単位 min/max、DuckDB の Row Group がいずれも
+   **セグメント単位統計での部分スキップ**を行っている共通点を確認し、
+   従来「テーブル全体で min/max 1組」だった粒度を細分化しました。
+   該当行が絶対に無いと証明できたセグメントは DataFusion へ渡さず、
+   生き残ったセグメントは `RecordBatch::slice` (ゼロコピー) として
+   1パーティションずつ登録します (枝刈りと並列実行が同時に効く)。
+   枝刈り結果は `OlapCache::plan_segment_pruning` で観測できます。
+
+3. **オブジェクトストレージ直結のテーブルフォーマット — Databend 方式**
+   (`crates/aruaru-backup/src/table_format.rs`)
+   中国語一次資料 (「Databend 存储架构总览」「Databend 索引结构说明」) で
+   確認した snapshot → segment → block の3層メタデータを実装:
+   - `_ss/<32桁16進>_v1.json` (snapshot) / `_sg/<32桁16進>_v1.json`
+     (segment、**最大1000 block**) というパス構成。
+   - block ごとの min/max (`ColumnStats`) と bloom filter による枝刈り。
+     segment 側の集約統計で**丸ごと読み飛ばせる場合は block を一切見ない**。
+   - `prev_snapshot_id` の連鎖による時間旅行。
+   - **MetaSrv 相当の Snapshot Key の楽観的 CAS が成功して初めてコミット
+     成立**(古い親の上への書き込みは `CommitConflict`)。
+
+**正直な現状**: 検証は `cargo test --workspace` / `cargo build --workspace`
+までです。(1) `wal_service` は同一プロセス内のオブジェクト分離であり
+ネットワーク越しのストリーミング複製・管理 REST API 公開・既存 SQL 経路
+(`AS OF COMMIT`) への接続は**未実施**、(2) `table_format` の `ObjectStore`
+実装はメモリ上のみで既存の `s3.rs` へ**未接続**、Parquet 実体の書き出しも
+行いません、(3) RisingWave の Hummock (epoch/barrier ベースのチェック
+ポイント) と SingleStore の hash index / 行レベルロックは**未実装**です。
+次回への引き継ぎは [CLAUDE.md](CLAUDE.md) の HANDOFF 節に記載しています。
+
+---
+
+## 📄 ライセンス
+
+Apache License 2.0 — 商用利用・改変・再配布すべて自由。  
+© 2026 aruaru-DB Contributors
+
+## API 方針: REST 全廃・gRPC / Connect へ (2026-11-04)
+
+### 日本語
+- **REST は全廃する。新しい API は REST で作らない。** ブラウザや `curl` から呼ぶ API は **Connect の単純呼び出し**(`POST /<パッケージ>.<Service>/<Method>`、`content-type: application/json`、本文は JSON)、サービス間は **gRPC / gRPC-web**(RPoem の管理API `open_runo.admin.v1.Admin` と同じ流儀)。ストリーミングは、必要になってから。
+- **既存の REST は、触るときに順に移す。** 移したら旧 REST の経路は消す。移行が終わるまで残るが、**新規には追加しない**。
+- **JSON は RS-JSON に統一**する(読み込みは `from_str_secure` / `parse_secure` でサイズ・深さ・重複キーの上限つき、書き出しは `rust_json::fast`)。ブラウザの WASM に `prost` は入れない(サイズが増えるため)。
+- **例外(自分たちの API ではなく、相手の規格が決めているもの)**: ACME、OAuth/OIDC のコールバック、第三者(GitHub など)からの Webhook、ヘルスチェック、静的ファイル配信、OTLP など。これらは規格どおりの HTTP を受ける。
+- 参考実装: `RPoem`(`open_runo.admin.v1.Admin`)、`open-easy-web`(`server/src/connect.rs`、`proto/open_easy_web/admin/v1/admin.proto`)。
+- ※ このリポジトリのコードが既に方針どおりかどうかは、各リポジトリの現状による。この節は方針の記録であり、コードの変更を意味しない。
+
+### English
+- **REST is being abolished. New APIs are not built as REST.** APIs called from browsers or `curl` use **Connect unary calls** (`POST /<package>.<Service>/<Method>`, `content-type: application/json`, JSON body); service-to-service calls use **gRPC / gRPC-web** (the same style as RPoem's admin API `open_runo.admin.v1.Admin`). Streaming only when it is actually needed.
+- **Existing REST endpoints are migrated one by one, when they are touched.** The old REST route is removed once migrated. Until migration is finished they remain, but **no new ones are added**.
+- **JSON is unified on RS-JSON**: reading with `from_str_secure` / `parse_secure` (size, depth and duplicate-key limits), writing with `rust_json::fast`. `prost` is not put into browser WASM (it would grow the binary).
+- **Exceptions (shapes dictated by someone else's standard, not our own API)**: ACME, OAuth/OIDC callbacks, webhooks from third parties (e.g. GitHub), health checks, static file serving, OTLP, and so on. These accept plain HTTP as the standard requires.
+- Reference implementations: `RPoem` (`open_runo.admin.v1.Admin`) and `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Note: whether the code in a given repository already follows this policy depends on that repository. This section records the policy; it does not mean the code has been changed.
+
+### Deutsch (KI-Übersetzung, redaktionell überarbeitet; noch nicht von Muttersprachlern geprüft)
+- **REST wird vollständig abgeschafft; neue APIs entstehen nicht mehr als REST.** APIs, die aus dem Browser oder per `curl` aufgerufen werden, verwenden **unäre Connect-Aufrufe** (`POST /<Paket>.<Service>/<Methode>`, `content-type: application/json`, JSON-Body). Zwischen Diensten kommen **gRPC bzw. gRPC-web** zum Einsatz, im selben Stil wie die Admin-API von RPoem (`open_runo.admin.v1.Admin`). Streaming wird erst ergänzt, wenn es tatsächlich gebraucht wird.
+- **Bestehende REST-Endpunkte werden schrittweise umgestellt, und zwar immer dann, wenn man ohnehin an ihnen arbeitet.** Sobald ein Endpunkt umgestellt ist, wird die alte REST-Route entfernt. Bis zum Abschluss der Migration bleiben die übrigen bestehen, es werden aber **keine neuen mehr hinzugefügt**.
+- **JSON wird einheitlich über RS-JSON verarbeitet**: Gelesen wird mit `from_str_secure` bzw. `parse_secure` (mit Obergrenzen für Größe, Verschachtelungstiefe und doppelte Schlüssel), geschrieben mit `rust_json::fast`. `prost` wird nicht in das Browser-WASM aufgenommen, da es die Datei vergrößern würde.
+- **Ausnahmen (Schnittstellen, deren Form ein fremder Standard vorgibt und die nicht zu unserer eigenen API gehören)**: ACME, OAuth/OIDC-Callbacks, Webhooks von Drittanbietern (z. B. GitHub), Health-Checks, die Auslieferung statischer Dateien, OTLP und Ähnliches. Diese nehmen, wie vom jeweiligen Standard verlangt, gewöhnliches HTTP entgegen.
+- Referenzimplementierungen: `RPoem` (`open_runo.admin.v1.Admin`) und `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Hinweis: Ob der Code eines einzelnen Repositorys diese Richtlinie bereits erfüllt, hängt vom jeweiligen Repository ab. Dieser Abschnitt dokumentiert lediglich die Richtlinie; er besagt nicht, dass der Code schon angepasst wurde.
+
+### Русский (перевод выполнен с помощью ИИ и отредактирован; носителями языка пока не проверен)
+- **От REST мы полностью отказываемся; новые API больше не создаются в стиле REST.** API, к которым обращаются из браузера или через `curl`, используют **унарные вызовы Connect** (`POST /<пакет>.<Service>/<Method>`, `content-type: application/json`, тело запроса — JSON). Для взаимодействия между сервисами применяются **gRPC и gRPC-web** — в том же стиле, что и административный API RPoem (`open_runo.admin.v1.Admin`). Потоковая передача данных добавляется лишь тогда, когда в ней действительно возникает необходимость.
+- **Существующие REST-эндпоинты переводятся поэтапно — по мере того, как с ними приходится работать.** После перевода старый REST-маршрут удаляется. Пока миграция не завершена, оставшиеся эндпоинты сохраняются, но **новые не добавляются**.
+- **Работа с JSON унифицирована на основе RS-JSON**: чтение — через `from_str_secure` или `parse_secure` (с ограничениями на размер, глубину вложенности и повторяющиеся ключи), запись — через `rust_json::fast`. `prost` в браузерный WASM не включается, поскольку это увеличило бы размер файла.
+- **Исключения (интерфейсы, форму которых определяет чужой стандарт, а не наш собственный API)**: ACME, обратные вызовы OAuth/OIDC, вебхуки сторонних сервисов (например, GitHub), проверки работоспособности, раздача статических файлов, OTLP и тому подобное. Такие интерфейсы принимают обычный HTTP, как того требует соответствующий стандарт.
+- Эталонные реализации: `RPoem` (`open_runo.admin.v1.Admin`) и `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Примечание: соответствует ли код конкретного репозитория этой политике, зависит от самого репозитория. Данный раздел лишь фиксирует политику и не означает, что код уже изменён.
+
+## API 方針の補足: 用語の整理と使い分け (2026-11-04)
+
+### 日本語
+**1つに統一するものではなく、別の層の話です。** 「REST の代わり」になるのは Connect・gRPC・GraphQL だけで、WASM は画面を作る技術です。
+
+| 用語 | 何か | REST の代わりか |
+|---|---|---|
+| REST | URL と HTTP メソッドで操作を表す API の作り方 | 全廃する側 |
+| **Connect** | `POST /サービス名/メソッド名` に JSON を送る形式。`curl` でもブラウザの `fetch` でも呼べる | はい(**採用**) |
+| **gRPC** | 同じ「サービス/メソッド」の考え方を、バイナリ(protobuf)と HTTP/2 で行う形式。速く、ストリーミングも得意 | はい(**サービス同士に採用**) |
+| gRPC-web | gRPC のブラウザ向けの変形版 | はい(必要なら) |
+| GraphQL | 欲しい項目を問い合わせる形式 | 一部だけ(**問い合わせ(読み取り)専用**) |
+| WASM | Rust をブラウザの中で動かす仕組み | いいえ(画面を作る技術) |
+
+- **ブラウザの画面や `curl` から呼ぶ API は Connect**(POST、JSON を RS-JSON で読み書き)。ブラウザの WASM は素の gRPC を話せず、Connect なら `fetch` のままで、`prost` を足さずに済む(画面のサイズも増えない)。
+- **サービス同士の通信(サーバー間、重い処理、ストリーミング)は gRPC。** 多くは Connect で足りるので、ストリーミングが必要になった所だけ gRPC に上げる。
+- **GraphQL は、まとめて問い合わせたいときの読み取り専用。** 書き込み(操作)には使わない。
+- **WASM は画面を作る技術として、そのまま使う。** 画面から呼ぶ API が Connect になっただけ。
+- 外部の規格が形を決めるもの(ACME、OAuth のコールバック、第三者の Webhook、ヘルスチェック、静的ファイル、OTLP)は、規格どおりの HTTP のまま。
+- **迷ったら Connect。**
+
+### English
+**These are not alternatives to unify; they sit at different layers.** Only Connect, gRPC and GraphQL can replace REST; WASM is a way to build the UI.
+
+| Term | What it is | Replaces REST? |
+|---|---|---|
+| REST | API style that expresses operations through URLs and HTTP methods | The thing being abolished |
+| **Connect** | `POST /Service/Method` with a JSON body; callable from `curl` and from a browser `fetch` | Yes (**adopted**) |
+| **gRPC** | The same service/method idea over binary (protobuf) and HTTP/2; fast, good at streaming | Yes (**for service-to-service**) |
+| gRPC-web | A browser-friendly variant of gRPC | Yes (if needed) |
+| GraphQL | A query language: ask for exactly the fields you want | Partly (**read-only queries**) |
+| WASM | Runs Rust inside the browser | No (a UI technology) |
+
+- **APIs called from browser screens or `curl` use Connect** (POST, JSON read and written with RS-JSON). Browser WASM cannot speak plain gRPC; with Connect it stays a `fetch`, and `prost` is not needed (the binary does not grow).
+- **Service-to-service calls (server to server, heavy work, streaming) use gRPC.** Connect is enough in most places; move a call to gRPC only where streaming is actually needed.
+- **GraphQL is read-only**, for queries that gather several pieces of data. It is not used for writes (operations).
+- **WASM stays as the way to build the UI.** The API it calls simply became Connect.
+- Interfaces whose shape an outside standard dictates (ACME, OAuth callbacks, third-party webhooks, health checks, static files, OTLP) stay plain HTTP.
+- **When in doubt, use Connect.**
+
+### Deutsch (KI-Übersetzung, sprachlich überarbeitet; noch nicht von Muttersprachlern geprüft)
+**Es geht nicht darum, eine einzige Technik auszuwählen – die Begriffe liegen auf unterschiedlichen Ebenen.** Als Ersatz für REST kommen nur Connect, gRPC und GraphQL in Frage; WASM dagegen ist eine Technik, mit der die Benutzeroberfläche gebaut wird.
+
+| Begriff | Was ist das? | Ersatz für REST? |
+|---|---|---|
+| REST | Ein API-Stil, bei dem Operationen über URLs und HTTP-Methoden ausgedrückt werden | wird abgeschafft |
+| **Connect** | `POST /Dienst/Methode` mit JSON im Body; aufrufbar mit `curl` ebenso wie mit `fetch` im Browser | ja (**gewählt**) |
+| **gRPC** | Dasselbe Prinzip aus Dienst und Methode, aber über binäres protobuf und HTTP/2; schnell und gut für Streaming geeignet | ja (**zwischen Diensten**) |
+| gRPC-web | Eine für den Browser angepasste Variante von gRPC | ja (bei Bedarf) |
+| GraphQL | Abfragesprache, mit der man genau die benötigten Felder anfordert | teilweise (**nur für lesende Abfragen**) |
+| WASM | Führt Rust-Code direkt im Browser aus | nein (Technik für die Oberfläche) |
+
+- **APIs, die von Browseroberflächen oder per `curl` aufgerufen werden, verwenden Connect** (POST; JSON wird mit RS-JSON gelesen und geschrieben). WASM im Browser kann kein reines gRPC sprechen. Mit Connect bleibt es bei einem gewöhnlichen `fetch`, und `prost` ist nicht nötig – die WASM-Datei wird dadurch nicht größer.
+- **Für die Kommunikation zwischen Diensten (Server zu Server, rechenintensive Aufgaben, Streaming) wird gRPC eingesetzt.** In den meisten Fällen reicht Connect aus; auf gRPC wird nur dort umgestellt, wo Streaming tatsächlich gebraucht wird.
+- **GraphQL dient ausschließlich lesenden Abfragen**, wenn mehrere Informationen gebündelt abgefragt werden sollen. Für Schreibzugriffe (Operationen) wird es nicht verwendet.
+- **WASM bleibt die Technik für die Oberfläche.** Geändert hat sich lediglich, dass die aufgerufene API nun auf Connect beruht.
+- Schnittstellen, deren Form durch einen externen Standard festgelegt ist (ACME, OAuth-Callbacks, Webhooks von Drittanbietern, Health-Checks, statische Dateien, OTLP), bleiben gewöhnliches HTTP.
+- **Im Zweifel: Connect.**
+
+### Русский (перевод выполнен с помощью ИИ и литературно отредактирован; носителями языка пока не проверен)
+**Это не варианты, из которых нужно выбрать один, а технологии разных уровней.** Заменить REST могут только Connect, gRPC и GraphQL; WASM же — это способ создания пользовательского интерфейса.
+
+| Термин | Что это | Заменяет REST? |
+|---|---|---|
+| REST | Стиль построения API, при котором операции выражаются через URL и HTTP-методы | отменяется |
+| **Connect** | `POST /Сервис/Метод` с телом в формате JSON; вызывается как из `curl`, так и из браузерного `fetch` | да (**выбран**) |
+| **gRPC** | Тот же принцип «сервис — метод», но поверх двоичного формата protobuf и HTTP/2; работает быстро и хорошо подходит для потоковой передачи | да (**для связи между сервисами**) |
+| gRPC-web | Адаптированный для браузера вариант gRPC | да (при необходимости) |
+| GraphQL | Язык запросов: клиент запрашивает ровно те поля, которые ему нужны | частично (**только запросы на чтение**) |
+| WASM | Позволяет выполнять код на Rust прямо в браузере | нет (технология для интерфейса) |
+
+- **API, которые вызываются из браузерных интерфейсов или через `curl`, строятся на Connect** (POST; JSON читается и записывается через RS-JSON). Браузерный WASM не умеет работать с «чистым» gRPC. С Connect достаточно обычного `fetch`, а `prost` не требуется — размер WASM-файла не увеличивается.
+- **Для обмена между сервисами (сервер — сервер, ресурсоёмкие задачи, потоковая передача) применяется gRPC.** В большинстве случаев достаточно Connect; на gRPC переходят только там, где потоковая передача действительно необходима.
+- **GraphQL используется только для чтения**, когда нужно получить сразу несколько связанных данных. Для записи (операций) он не применяется.
+- **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
+- Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
+- **Если есть сомнения — выбирайте Connect.**
+
+## REST→Connect 移行(2026-11-05)
+管理操作は `POST /open_runo.aruaru.admin.v1.Admin/<Method>`(21メソッド)、ノード間配布・メール退避は `.../AdminNode/<Method>`、デモwebは `/open_runo.aruaru.web.v1.Demo/{Status,Rebalance}`、列レプリカ観測は `/open_runo.aruaru.columnar.v1.Columnar/{Status,Prune}` の Connect 単純呼び出し(JSON本文、`x-admin-token`、JSONはRS-JSON `parse_secure`)。旧 `/admin/*` のREST(ノード間 `raft`・`closed-timestamp/receive` を含む)は削除済み。例外は `/healthz`・`/graphql/sdl`・PostgreSQLワイヤー・`/graphql`(問い合わせ)。本番(VPS)反映の手順: glibc 2.39 以下で作るため **Ubuntu 24.04(WSL `Ubuntu-24.04`)でリリースビルド** → `objdump -T` で GLIBC_2.39 以下を確認 → scp → バックアップ → 入れ替え → 再起動 → curl(401/200/400/旧REST 404)。詳細・未了は `CLAUDE.md` の「REST→Connect移行状況」。
+
